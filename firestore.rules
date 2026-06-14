@@ -1,0 +1,11 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Allows any authenticated user full read and write access to all collections and sub-collections.
+    // Extremely robust for internal supermarket operations under a single authenticated user.
+    match /{document=**} {
+      allow read, write: if request.auth != null;
+    }
+  }
+}

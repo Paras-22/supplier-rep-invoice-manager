@@ -1,0 +1,8 @@
+{
+  "name": "Supplier Rep & Invoice Manager",
+  "description": "Wholesale supplier representatives directory and automated docket scanning manager built for Chapel Downs Supermarket in Auckland, New Zealand. Extracts line item costs using Gemini 3.5 Flash, tracking direct price comparisons and historical timeline charts.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

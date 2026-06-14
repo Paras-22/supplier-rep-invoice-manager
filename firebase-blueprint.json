@@ -1,0 +1,151 @@
+{
+  "entities": {
+    "Product": {
+      "title": "Product",
+      "description": "A single product definition retrieved from Idealpos or added manually",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique product ID or barcode" },
+        "name": { "type": "string", "description": "Name of the product" },
+        "sku": { "type": "string", "description": "Idealpos barcode or code" },
+        "category": { "type": "string", "description": "Category of the product" },
+        "lowStock": { "type": "boolean", "description": "Flag indicating if stock level is currently low" },
+        "minStockLevel": { "type": "number", "description": "Minimum required stock level threshold" },
+        "currentStock": { "type": "number", "description": "Current on-hand physical stock quantity" },
+        "preferredRepId": { "type": "string", "description": "ID of the preferred rep for this product, if any" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Timestamp of creation" },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Timestamp of last update" }
+      },
+      "required": ["id", "name", "lowStock", "createdAt"]
+    },
+    "Rep": {
+      "title": "Rep",
+      "description": "Supplier representative profile details",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique repository of rep ID" },
+        "name": { "type": "string", "description": "Name of the rep" },
+        "company": { "type": "string", "description": "Company name representing" },
+        "email": { "type": "string", "description": "Contact email of the rep" },
+        "phone": { "type": "string", "description": "Contact phone of the rep" },
+        "notes": { "type": "string", "description": "General profile description or terms comments" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Profile creation timestamp" }
+      },
+      "required": ["id", "name", "company", "createdAt"]
+    },
+    "Visit": {
+      "title": "Visit",
+      "description": "Visit note record for a supplier rep",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique note ID" },
+        "repId": { "type": "string", "description": "Associated representative ID" },
+        "visitDate": { "type": "string", "format": "date-time", "description": "Actual date/time of visit" },
+        "notes": { "type": "string", "description": "Review or summary details written by staff" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Record creation timestamp" },
+        "createdBy": { "type": "string", "description": "User UID who recorded the notes" }
+      },
+      "required": ["id", "repId", "visitDate", "notes", "createdAt", "createdBy"]
+    },
+    "Price": {
+      "title": "Price",
+      "description": "Rep price log entry representing a single point in price history",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique price log entry ID" },
+        "productId": { "type": "string", "description": "Associated product ID" },
+        "repId": { "type": "string", "description": "Associated representative ID" },
+        "price": { "type": "number", "description": "The cost price supplied by this rep" },
+        "packSize": { "type": "string", "description": "Pack size description, e.g. Box of 12" },
+        "effectiveDate": { "type": "string", "format": "date-time", "description": "Date from which this price was effective" },
+        "invoiceId": { "type": "string", "description": "Associated scanning invoice ID if extracted from invoice" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Audit creation timestamp" },
+        "createdBy": { "type": "string", "description": "Staff member UID who recorded the price" }
+      },
+      "required": ["id", "productId", "repId", "price", "effectiveDate", "createdAt", "createdBy"]
+    },
+    "Invoice": {
+      "title": "Invoice",
+      "description": "Uploaded invoice or docket scan details and extracted AI items representation",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique invoice record ID" },
+        "fileUrl": { "type": "string", "description": "URL link to the file in Firebase Storage" },
+        "fileName": { "type": "string", "description": "Name of the file" },
+        "repId": { "type": "string", "description": "Linked rep ID, empty/null if unidentified" },
+        "repName": { "type": "string", "description": "Extracted supplier or rep name" },
+        "invoiceDate": { "type": "string", "description": "Extracted date of the docket/invoice" },
+        "totalAmount": { "type": "number", "description": "Extracted total of invoice" },
+        "status": { "type": "string", "description": "Record status: pending_review or confirmed" },
+        "items": {
+          "type": "array",
+          "description": "A list of extracted items"
+        },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Timestamp of upload" },
+        "createdBy": { "type": "string", "description": "Staff member UID who uploaded" }
+      },
+      "required": ["id", "fileUrl", "fileName", "status", "createdAt", "createdBy"]
+    },
+    "Order": {
+      "title": "Order",
+      "description": "An exportable purchase draft order list per rep before their visit",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique order ID" },
+        "repId": { "type": "string", "description": "Associated representative ID" },
+        "status": { "type": "string", "description": "Order status, e.g. draft or sent" },
+        "totalCostEstimate": { "type": "number", "description": "Total estimated cost based on rep current prices" },
+        "items": {
+          "type": "array",
+          "description": "List of ordered items with productId, productName, quantity, price"
+        },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Timestamp of creation" },
+        "createdBy": { "type": "string", "description": "Staff user UID who created" }
+      },
+      "required": ["id", "repId", "status", "items", "createdAt", "createdBy"]
+    },
+    "User": {
+      "title": "User",
+      "description": "Registered staff user account profile",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "Unique authentication UID" },
+        "email": { "type": "string", "description": "Registered email address" },
+        "displayName": { "type": "string", "description": "User profile full display name" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Timestamp of profile creation" },
+        "lastLogin": { "type": "string", "format": "date-time", "description": "Timestamp of last action of logging in" }
+      },
+      "required": ["uid", "email", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "User profiles collection"
+    },
+    "/products/{productId}": {
+      "schema": "Product",
+      "description": "Product collection"
+    },
+    "/reps/{repId}": {
+      "schema": "Rep",
+      "description": "Supplier reps collection"
+    },
+    "/reps/{repId}/visits/{visitId}": {
+      "schema": "Visit",
+      "description": "Visit notes subcollection per supplier rep"
+    },
+    "/prices/{priceId}": {
+      "schema": "Price",
+      "description": "Price history entries per rep per product"
+    },
+    "/invoices/{invoiceId}": {
+      "schema": "Invoice",
+      "description": "Uploaded invoice documents and extract logs review queue"
+    },
+    "/orders/{orderId}": {
+      "schema": "Order",
+      "description": "Draft order lists generated for visits"
+    }
+  }
+}

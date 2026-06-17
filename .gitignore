@@ -8,3 +8,6 @@ coverage/
 !.env.example
 .env 
 firebase-applet-config.json 
+products_clean.csv 
+Products_lists.txt 
+convert.cjs 

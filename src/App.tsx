@@ -1,6 +1,6 @@
 import { useState, useEffect, FormEvent } from "react";
 import { onAuthStateChanged, signInWithPopup, signOut, User, signInWithEmailAndPassword, createUserWithEmailAndPassword, updateProfile } from "firebase/auth";
-import { collection, onSnapshot, getDocs, doc, getDoc, setDoc, updateDoc, serverTimestamp } from "firebase/firestore";
+import { collection, onSnapshot, getDocs, doc, getDoc, setDoc, updateDoc, serverTimestamp, query, where } from "firebase/firestore";
 import { auth, db, googleProvider, testConnection, handleFirestoreError, OperationType } from "./firebase";
 import { Product, Rep, PriceEntry, Invoice, Visit } from "./types";
 import POSImport from "./components/POSImport";
@@ -8,7 +8,7 @@ import DocketScanner from "./components/DocketScanner";
 import ProductCatalog from "./components/ProductCatalog";
 import RepDirectory from "./components/RepDirectory";
 import LowStockAlerts from "./components/LowStockAlerts";
-import { Store, Receipt, Search, Users, ClipboardList, LogOut, CheckCircle2, ChevronRight, Lock, Sparkles, AlertTriangle } from "lucide-react";
+import { Store, Receipt, Search, Users, ClipboardList, LogOut, Lock, Sparkles, AlertTriangle } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 
 export default function App() {
@@ -100,18 +100,20 @@ export default function App() {
       handleFirestoreError(error, OperationType.LIST, "invoices");
     });
 
-    const unsubLowStock = onSnapshot(collection(db, "products"), (snapshot) => {
-      const lowList: Product[] = [];
-      snapshot.forEach(doc => {
-        const p = { id: doc.id, ...doc.data() } as Product;
-        if (p.lowStock || (p.currentStock !== undefined && p.minStockLevel !== undefined && p.currentStock < p.minStockLevel)) {
-          lowList.push(p);
-        }
-      });
-      setLowStockProducts(lowList);
-    }, (error) => {
-      handleFirestoreError(error, OperationType.LIST, "products");
-    });
+    // Only fetch products where lowStock === true — not all 13,000
+    const unsubLowStock = onSnapshot(
+      query(collection(db, "products"), where("lowStock", "==", true)),
+      (snapshot) => {
+        const lowList: Product[] = [];
+        snapshot.forEach(doc => {
+          lowList.push({ id: doc.id, ...doc.data() } as Product);
+        });
+        setLowStockProducts(lowList);
+      },
+      (error) => {
+        handleFirestoreError(error, OperationType.LIST, "products");
+      }
+    );
 
     return () => {
       unsubReps();

@@ -1,5 +1,5 @@
 export interface Product {
-  id: string; // SKU, Barcode, or auto-generated
+  id: string;
   name: string;
   sku?: string;
   category?: string;
@@ -7,7 +7,7 @@ export interface Product {
   minStockLevel?: number;
   currentStock?: number;
   preferredRepId?: string | null;
-  createdAt: any; // Firestore Timestamp
+  createdAt: any;
   updatedAt: any;
 }
 
@@ -49,6 +49,7 @@ export interface InvoiceItem {
   quantity: number;
   price: number;
   matchedProductId?: string | null;
+  matchedProductName?: string | null;
 }
 
 export interface Invoice {
@@ -66,7 +67,7 @@ export interface Invoice {
 }
 
 export interface OrderItem {
-  id: string; // unique item id inside list
+  id: string;
   productId: string;
   productName: string;
   quantity: number;

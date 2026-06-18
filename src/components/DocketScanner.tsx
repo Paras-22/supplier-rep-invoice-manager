@@ -1,23 +1,49 @@
 import React, { useState } from "react";
-import { FileUp, Receipt, Check, Loader2, AlertCircle, ShoppingBag, UserCheck, Plus, Sparkles, RefreshCw } from "lucide-react";
-import { collection, doc, setDoc, updateDoc, serverTimestamp, query, where, getDocs, limit } from "firebase/firestore";
+import { FileUp, Receipt, Check, Loader2, AlertCircle, ShoppingBag, UserCheck, Plus, Sparkles, RefreshCw, Edit2 } from "lucide-react";
+import { collection, doc, setDoc, updateDoc, serverTimestamp, query, where, getDocs, limit, or } from "firebase/firestore";
 import { db, handleFirestoreError, OperationType } from "../firebase";
-import { Rep, Product, Invoice, InvoiceItem } from "../types";
+import { Rep, Invoice, InvoiceItem } from "../types";
 import { motion } from "motion/react";
 
 interface DocketScannerProps {
   reps: Rep[];
-  products: Product[];
+  products: never[];
   onScanConfirmed: () => void;
   currentUserUid: string;
 }
 
 const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
 
+const callGemini = async (prompt: string, imagePart?: { mime_type: string; data: string }) => {
+  const parts: any[] = [];
+  if (imagePart) parts.push({ inline_data: imagePart });
+  parts.push({ text: prompt });
+
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts }],
+        generationConfig: { temperature: 0 }
+      })
+    }
+  );
+  if (!response.ok) {
+    const err = await response.json();
+    throw new Error(err?.error?.message || "Gemini API call failed");
+  }
+  const data = await response.json();
+  const raw = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+  return raw.replace(/```json|```/g, "").trim();
+};
+
 export default function DocketScanner({ reps, onScanConfirmed, currentUserUid }: DocketScannerProps) {
   const [dragActive, setDragActive] = useState(false);
   const [file, setFile] = useState<File | null>(null);
   const [status, setStatus] = useState<"idle" | "scanning" | "matching" | "review" | "saving" | "success" | "error">("idle");
+  const [matchingProgress, setMatchingProgress] = useState("");
 
   const [extractedData, setExtractedData] = useState<{
     supplierName: string;
@@ -42,11 +68,11 @@ export default function DocketScanner({ reps, onScanConfirmed, currentUserUid }:
     e.preventDefault();
     e.stopPropagation();
     setDragActive(false);
-    if (e.dataTransfer.files && e.dataTransfer.files[0]) handleFileSelected(e.dataTransfer.files[0]);
+    if (e.dataTransfer.files?.[0]) handleFileSelected(e.dataTransfer.files[0]);
   };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files[0]) handleFileSelected(e.target.files[0]);
+    if (e.target.files?.[0]) handleFileSelected(e.target.files[0]);
   };
 
   const handleFileSelected = (selectedFile: File) => {
@@ -60,92 +86,17 @@ export default function DocketScanner({ reps, onScanConfirmed, currentUserUid }:
     setStatus("idle");
   };
 
-  const convertFileToBase64 = (selectedFile: File): Promise<{ base64: string; mimeType: string }> => {
-    return new Promise((resolve, reject) => {
+  const convertFileToBase64 = (selectedFile: File): Promise<{ base64: string; mimeType: string }> =>
+    new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.readAsDataURL(selectedFile);
       reader.onload = () => {
         const result = reader.result as string;
-        const base64Str = result.substring(result.indexOf(",") + 1);
-        resolve({ base64: base64Str, mimeType: selectedFile.type });
+        resolve({ base64: result.substring(result.indexOf(",") + 1), mimeType: selectedFile.type });
       };
-      reader.onerror = (err) => reject(err);
+      reader.onerror = reject;
     });
-  };
 
-  // Step 1 — Call Gemini to extract docket data
-  const callGeminiOCR = async (base64: string, mimeType: string) => {
-const prompt = `You are an expert invoice analyzer for a New Zealand supermarket.
-Analyze this supplier docket/invoice carefully.
-
-Extract and return ONLY a valid JSON object with no markdown, no explanation:
-{
-  "supplierName": "full company name on the docket",
-  "repName": "sales rep name if visible, otherwise null",
-  "invoiceDate": "date in YYYY-MM-DD format, or null",
-  "totalAmount": total invoice amount as number or 0,
-  "items": [
-    {
-      "name": "full expanded standardised product name in UPPERCASE",
-      "code": "supplier product code if visible, otherwise null",
-      "quantity": number of units/cartons ordered as integer,
-      "price": unit price as number
-    }
-  ]
-}
-
-Critical rules for product names:
-- Always write product names in UPPERCASE
-- EXPAND all abbreviations:
-  * "B/B" → "BIG BANG" or keep as brand name
-  * Numbers in brackets like "(24)" or "(12)" = pack size, include as part of name
-  * "Msshi" or "Mssh" → "MUSASHI"
-  * "Shrd" → "SHREDDED"  
-  * "Enrgy" → "ENERGY"
-  * "Rasp/Lm" → "RASPBERRY LEMON"
-  * "P/Fruit" → "PASSIONFRUIT"
-  * Any abbreviation → expand to full English word
-- Include: Brand + Product Type + Size/Volume + Flavour
-- Remove pack quantity multipliers like "x12", "x24", "12pk" from the name
-- Examples:
-  * "MUSASHI ENERGY 500ML (12) MANGO" → "MUSASHI ENERGY 500ML MANGO"
-  * "kobi salted peanuts 130gx24ctn" → "KOBI SALTED PEANUTS 130G"
-  * "Colgate175gmx12 Regular (Blue)" → "COLGATE TOOTHPASTE 175G REGULAR"
-  * "B/B 375ML GUAVA (24)" → "BIG BANG 375ML GUAVA"
-  * "KITKAT CHUNKY HAZEL NUTTY (24)" → "KITKAT CHUNKY HAZELNUT"
-- For the price field: use the UNIT PRICE column value
-- For the quantity field: use the QTY column value as integer
-- Return only the JSON, nothing else`;
-
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{
-            parts: [
-              { inline_data: { mime_type: mimeType, data: base64 } },
-              { text: prompt }
-            ]
-          }],
-          generationConfig: { temperature: 0.1 }
-        })
-      }
-    );
-
-    if (!response.ok) {
-      const err = await response.json();
-      throw new Error(err?.error?.message || "Gemini API call failed");
-    }
-
-    const data = await response.json();
-    const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-    const cleaned = rawText.replace(/```json|```/g, "").trim();
-    return JSON.parse(cleaned);
-  };
-
-  // Step 3 — Auto create rep if not exists
   const findOrCreateRep = async (supplierName: string, repName: string | null): Promise<string> => {
     const existingRep = reps.find(r =>
       r.company.toLowerCase().includes(supplierName.toLowerCase()) ||
@@ -164,156 +115,160 @@ Critical rules for product names:
   };
 
   const handleStartOCRScan = async () => {
-    if (!file) {
-      setStatus("error");
-      setErrorMessage("Please select a file to scan.");
-      return;
-    }
-
-    if (!GEMINI_API_KEY) {
-      setStatus("error");
-      setErrorMessage("Gemini API key not found. Add VITE_GEMINI_API_KEY to your .env file.");
-      return;
-    }
+    if (!file) { setStatus("error"); setErrorMessage("Please select a file to scan."); return; }
+    if (!GEMINI_API_KEY) { setStatus("error"); setErrorMessage("Gemini API key not found. Add VITE_GEMINI_API_KEY to your .env file."); return; }
 
     setStatus("scanning");
     try {
       const { base64, mimeType } = await convertFileToBase64(file);
 
-      // Step 1 — Extract docket data with Gemini
-      const ocrPayload = await callGeminiOCR(base64, mimeType);
+      // ── STEP 1: OCR — extract docket data ──────────────────────────────
+      const ocrPrompt = `You are an expert invoice analyzer for a New Zealand supermarket.
+Analyze this supplier docket/invoice carefully.
 
+Extract and return ONLY a valid JSON object with no markdown, no explanation:
+{
+  "supplierName": "full company name on the docket",
+  "repName": "sales rep name if visible, otherwise null",
+  "invoiceDate": "date in YYYY-MM-DD format, or null",
+  "totalAmount": total invoice amount as number or 0,
+  "items": [
+    {
+      "name": "full expanded standardised product name in UPPERCASE English",
+      "code": "supplier product code if visible, otherwise null",
+      "quantity": quantity ordered as whole number,
+      "price": unit price as decimal number
+    }
+  ]
+}
+
+Critical rules:
+- ALL product names in UPPERCASE
+- Expand ALL abbreviations: Msshi→MUSASHI, Shrd→SHREDDED, Enrgy→ENERGY, Rasp→RASPBERRY, Lm→LEMON, P/Fruit→PASSIONFRUIT, Choc→CHOCOLATE, Straw→STRAWBERRY, Van→VANILLA, B/B→BIG BANG
+- Include: Brand + Product Type + Size/Volume + Flavour
+- Remove pack multipliers (x12, x24, 12pk, per carton) from name
+- Numbers in brackets (24) (12) = carton size, remove from name
+- Keep product size like 375ML, 500ML, 130G in name
+- price = UNIT PRICE column value
+- quantity = QTY column value as integer
+- Return only JSON, nothing else`;
+
+      const ocrRaw = await callGemini(ocrPrompt, { mime_type: mimeType, data: base64 });
+      const ocrPayload = JSON.parse(ocrRaw);
+
+      // ── STEP 2: SMART MATCHING — minimal Firestore reads ───────────────
       setStatus("matching");
+      setMatchingProgress("Collecting unique search terms...");
 
-      // Step 2 — Batch fetch candidates for all products
-      const allCandidates: {
-        itemIndex: number;
-        itemName: string;
-        candidates: { id: string; name: string }[];
-      }[] = [];
+      const items: any[] = ocrPayload.items || [];
 
-      for (let i = 0; i < ocrPayload.items.length; i++) {
-        const item = ocrPayload.items[i];
+      // Collect all unique first words across ALL docket items — deduped
+      const firstWords = new Set<string>();
+      const codes = new Set<string>();
+
+      items.forEach((item: any) => {
         const nameUpper = (item.name || "").toUpperCase();
         const firstWord = nameUpper.split(" ")[0];
+        if (firstWord && firstWord.length > 2) firstWords.add(firstWord);
+        if (item.code && item.code !== "null") codes.add(item.code);
+      });
 
-        // Try exact name match first
-        const exactSnap = await getDocs(
-          query(collection(db, "products"), where("name", "==", nameUpper), limit(1))
-        );
-        if (!exactSnap.empty) {
-          allCandidates.push({
-            itemIndex: i,
-            itemName: item.name,
-            candidates: [{ id: exactSnap.docs[0].id, name: exactSnap.docs[0].data().name }]
-          });
-          continue;
-        }
+      setMatchingProgress(`Searching database for ${firstWords.size} unique brands...`);
 
-        // Try code match
-        if (item.code) {
-          const codeSnap = await getDocs(
-            query(collection(db, "products"), where("sku", "==", item.code), limit(1))
-          );
-          if (!codeSnap.empty) {
-            allCandidates.push({
-              itemIndex: i,
-              itemName: item.name,
-              candidates: [{ id: codeSnap.docs[0].id, name: codeSnap.docs[0].data().name }]
-            });
-            continue;
-          }
-        }
+      // ONE batch query per unique first word — fetch all candidates at once
+      const candidateMap: Map<string, { id: string; name: string; sku: string }> = new Map();
 
-        // Get broad candidates by first word
-        if (firstWord && firstWord.length > 2) {
-          const broadSnap = await getDocs(
-            query(
-              collection(db, "products"),
-              where("name", ">=", firstWord),
-              where("name", "<=", firstWord + "\uf8ff"),
-              limit(10)
-            )
-          );
-          allCandidates.push({
-            itemIndex: i,
-            itemName: item.name,
-            candidates: broadSnap.docs.map(d => ({
-              id: d.id,
-              name: d.data().name || ""
-            }))
-          });
-        } else {
-          allCandidates.push({
-            itemIndex: i,
-            itemName: item.name,
-            candidates: []
-          });
-        }
-      }
-
-      // Single Gemini batch call to match ALL products at once
-      const batchMatchPrompt = `You are a product matching assistant for a New Zealand supermarket.
-
-Below are products from a supplier docket with possible database matches.
-Match each docket product to the best database candidate.
-
-Products:
-${allCandidates.map((c, i) => `
-Product ${i + 1}: "${c.itemName}"
-Candidates:
-${c.candidates.length > 0
-  ? c.candidates.map(cand => `  - ID: ${cand.id} | Name: ${cand.name}`).join("\n")
-  : "  No candidates found"
-}`).join("\n")}
-
-Rules:
-- Match based on similarity — same brand, product type, size
-- Word order differences are OK
-- If no candidate is a reasonable match use null
-- Return ONLY a JSON array, no markdown, no explanation:
-[
-  {"productIndex": 1, "matchedId": "id_or_null"},
-  {"productIndex": 2, "matchedId": "id_or_null"}
-]`;
-
-      const batchResponse = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: batchMatchPrompt }] }],
-            generationConfig: { temperature: 0 }
-          })
-        }
+      // Fetch by first word (brand name) — covers most products
+      const wordQueries = Array.from(firstWords).map(word =>
+        getDocs(query(
+          collection(db, "products"),
+          where("name", ">=", word),
+          where("name", "<=", word + "\uf8ff"),
+          limit(15)
+        ))
       );
 
-      const batchData = await batchResponse.json();
-      const batchRaw = batchData?.candidates?.[0]?.content?.parts?.[0]?.text || "[]";
-      const batchCleaned = batchRaw.replace(/```json|```/g, "").trim();
+      // Fetch by supplier code
+      const codeQueries = Array.from(codes).map(code =>
+        getDocs(query(
+          collection(db, "products"),
+          where("sku", "==", code),
+          limit(1)
+        ))
+      );
 
-      let matchResults: { productIndex: number; matchedId: string | null }[] = [];
+      // Run ALL queries in parallel
+      const [wordResults, codeResults] = await Promise.all([
+        Promise.all(wordQueries),
+        Promise.all(codeQueries)
+      ]);
+
+      // Build candidate map in memory — zero more Firestore reads after this
+      [...wordResults, ...codeResults].forEach(snap => {
+        snap.docs.forEach(d => {
+          candidateMap.set(d.id, {
+            id: d.id,
+            name: d.data().name || "",
+            sku: d.data().sku || ""
+          });
+        });
+      });
+
+      const allCandidates = Array.from(candidateMap.values());
+      setMatchingProgress(`Found ${allCandidates.length} candidates. Asking Gemini to match...`);
+
+      // ── STEP 3: ONE Gemini call to match ALL products at once ──────────
+      const matchPrompt = `You are a product matching assistant for a New Zealand supermarket.
+
+Match each docket product to the best database candidate IN MEMORY — no more database calls needed.
+
+Docket products to match:
+${items.map((item: any, i: number) => `${i + 1}. "${item.name}" (code: ${item.code || "none"})`).join("\n")}
+
+Database candidates available:
+${allCandidates.map(c => `- ID: ${c.id} | Name: ${c.name} | SKU: ${c.sku}`).join("\n")}
+
+Matching rules:
+- Match by brand + product type + size/volume + flavour
+- Word order differences are OK (MUSASHI ENERGY MANGO 500ML = MUSASHI 500ML MANGO)
+- Size must match (500ML ≠ 375ML)
+- Flavour must match (MANGO ≠ PINEAPPLE)
+- If supplier code matches SKU exactly — that is a definitive match
+- If no reasonable match exists — use null
+- Do NOT force a wrong match
+
+Return ONLY a JSON array, no markdown:
+[
+  {"productIndex": 1, "matchedId": "barcode_id_or_null", "confidence": "high/medium/low/none"},
+  {"productIndex": 2, "matchedId": "barcode_id_or_null", "confidence": "high/medium/low/none"}
+]`;
+
+      const matchRaw = await callGemini(matchPrompt);
+      let matchResults: { productIndex: number; matchedId: string | null; confidence: string }[] = [];
       try {
-        matchResults = JSON.parse(batchCleaned);
+        matchResults = JSON.parse(matchRaw);
       } catch {
-        console.error("Batch match parse error:", batchCleaned);
+        console.error("Match parse error:", matchRaw);
         matchResults = [];
       }
 
-      // Build final matched items
-      const matchedItems: InvoiceItem[] = ocrPayload.items.map((item: any, index: number) => {
+      // Build final items — only accept high/medium confidence matches
+      const matchedItems: InvoiceItem[] = items.map((item: any, index: number) => {
         const match = matchResults.find((r: any) => r.productIndex === index + 1);
+        const acceptMatch = match?.matchedId && match.confidence !== "low" && match.confidence !== "none";
+        const candidate = acceptMatch ? candidateMap.get(match!.matchedId!) : null;
+
         return {
           name: item.name,
           code: item.code || null,
           quantity: item.quantity || 1,
           price: item.price || 0,
-          matchedProductId: match?.matchedId || ""
+          matchedProductId: acceptMatch ? match!.matchedId! : "",
+          matchedProductName: candidate?.name || ""
         };
       });
 
-      // Step 3 — Find or create rep
+      // ── STEP 4: Find or create rep ─────────────────────────────────────
       const repId = await findOrCreateRep(
         ocrPayload.supplierName || "Unknown Supplier",
         ocrPayload.repName
@@ -330,11 +285,11 @@ Rules:
 
       // Save pending invoice draft
       const invoiceRef = doc(collection(db, "invoices"));
-      const invoiceDraft: Invoice = {
+      await setDoc(invoiceRef, {
         id: invoiceRef.id,
         fileUrl: "frontend-upload",
         fileName: file.name,
-        repId: repId,
+        repId,
         repName: ocrPayload.repName || ocrPayload.supplierName,
         invoiceDate: ocrPayload.invoiceDate || new Date().toISOString().split("T")[0],
         totalAmount: ocrPayload.totalAmount || 0,
@@ -342,8 +297,7 @@ Rules:
         items: matchedItems,
         createdAt: serverTimestamp(),
         createdBy: currentUserUid
-      };
-      await setDoc(invoiceRef, invoiceDraft);
+      } as Invoice);
       setInvoiceRecordId(invoiceRef.id);
       setStatus("review");
 
@@ -365,9 +319,8 @@ Rules:
     if (!extractedData) return;
     const item = extractedData.items[index];
     const newId = `DOCKET_${Math.floor(Date.now() / 1000)}_${index}`;
-    const prodRef = doc(db, "products", newId);
     try {
-      await setDoc(prodRef, {
+      await setDoc(doc(db, "products", newId), {
         id: newId,
         name: item.name.toUpperCase(),
         sku: item.code || newId,
@@ -378,6 +331,7 @@ Rules:
         updatedAt: serverTimestamp()
       });
       handleUpdateItemField(index, "matchedProductId", newId);
+      handleUpdateItemField(index, "matchedProductName" as any, item.name.toUpperCase());
     } catch (err) {
       handleFirestoreError(err, OperationType.CREATE, `products/${newId}`);
     }
@@ -443,6 +397,9 @@ Rules:
     }
   };
 
+  const matchedCount = extractedData?.items.filter(i => i.matchedProductId).length || 0;
+  const totalCount = extractedData?.items.length || 0;
+
   return (
     <div className="bg-white rounded-md shadow-sm border border-slate-200 p-4">
 
@@ -454,7 +411,7 @@ Rules:
         </div>
         <div className="flex items-center gap-1 px-2 py-0.5 bg-emerald-50 rounded border border-emerald-100 text-[9px] font-bold text-emerald-800">
           <Sparkles className="h-2.5 w-2.5 animate-pulse" />
-          <span>Gemini 2.5 Flash Active</span>
+          <span>Gemini 2.5 Flash — 2 API calls per docket</span>
         </div>
       </div>
 
@@ -463,10 +420,8 @@ Rules:
         <div className="space-y-3">
           {!file ? (
             <div
-              onDragEnter={handleDrag}
-              onDragOver={handleDrag}
-              onDragLeave={handleDrag}
-              onDrop={handleDrop}
+              onDragEnter={handleDrag} onDragOver={handleDrag}
+              onDragLeave={handleDrag} onDrop={handleDrop}
               onClick={() => document.getElementById("docket_file_picker")?.click()}
               className={`border-2 border-dashed rounded p-8 flex flex-col items-center justify-center cursor-pointer transition-all ${
                 dragActive ? "border-emerald-500 bg-emerald-50/30" : "border-slate-200 hover:border-emerald-400 bg-slate-50/40"
@@ -488,9 +443,7 @@ Rules:
                 </div>
               </div>
               <div className="flex items-center gap-1.5">
-                <button onClick={() => setFile(null)} className="px-2 py-1 text-[10px] font-semibold text-slate-500 hover:text-slate-700 cursor-pointer">
-                  Clear
-                </button>
+                <button onClick={() => setFile(null)} className="px-2 py-1 text-[10px] font-semibold text-slate-500 hover:text-slate-700 cursor-pointer">Clear</button>
                 <button onClick={handleStartOCRScan} className="px-2.5 py-1 text-[10px] font-semibold bg-emerald-700 hover:bg-emerald-800 text-white rounded cursor-pointer flex items-center gap-1">
                   <Sparkles className="h-3 w-3" />
                   <span>Start Gemini Scan</span>
@@ -518,7 +471,8 @@ Rules:
           <Loader2 className="h-8 w-8 text-emerald-600 animate-spin" />
           <div className="text-center">
             <h3 className="text-xs font-bold text-slate-800">Matching products to database...</h3>
-            <p className="text-[10px] text-slate-400 mt-0.5">Batch matching all products in one call.</p>
+            <p className="text-[10px] text-slate-400 mt-0.5">{matchingProgress || "Loading candidates..."}</p>
+            <p className="text-[9px] text-slate-300 mt-1">Minimal database reads — matching in memory</p>
           </div>
         </div>
       )}
@@ -557,9 +511,11 @@ Rules:
                 <ShoppingBag className="h-3.5 w-3.5 text-emerald-600" />
                 <span>Extracted Products — Review Before Saving</span>
               </h3>
-              <p className="text-[9px] text-slate-400">
-                {extractedData.items.filter(i => i.matchedProductId).length}/{extractedData.items.length} matched to database
-              </p>
+              <div className="flex items-center gap-2">
+                <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${matchedCount === totalCount ? "bg-emerald-100 text-emerald-700" : "bg-amber-100 text-amber-700"}`}>
+                  {matchedCount}/{totalCount} matched
+                </span>
+              </div>
             </div>
 
             <div className="overflow-x-auto border border-slate-200 rounded">
@@ -568,42 +524,71 @@ Rules:
                   <tr className="bg-slate-50 text-slate-500 font-bold uppercase text-[8px] border-b border-slate-200">
                     <th className="p-1 px-2.5">Database Match</th>
                     <th className="p-1 px-2.5">Product Name (from docket)</th>
-                    <th className="p-1 px-2 w-24">Code</th>
+                    <th className="p-1 px-2 w-24">Barcode / Code</th>
                     <th className="p-1 px-2 w-12 text-center">Qty</th>
                     <th className="p-1 px-2 w-20">Unit Price ($)</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
                   {extractedData.items.map((item, index) => (
-                    <tr key={index} className="hover:bg-slate-50/50">
-                      <td className="p-1 px-2">
+                    <tr key={index} className={`hover:bg-slate-50/50 ${item.matchedProductId ? "" : "bg-amber-50/30"}`}>
+
+                      {/* DATABASE MATCH COLUMN */}
+                      <td className="p-1 px-2 min-w-[160px]">
                         {item.matchedProductId ? (
-                          <div className="flex items-center gap-1 px-1.5 py-0.5 bg-emerald-50 text-emerald-800 rounded font-bold text-[9px] w-fit">
-                            <Check className="h-3 w-3 shrink-0" />
-                            <span className="line-clamp-1 max-w-[120px]">{item.matchedProductId}</span>
+                          <div className="space-y-0.5">
+                            <div className="flex items-center gap-1 px-1.5 py-0.5 bg-emerald-50 text-emerald-800 rounded font-bold text-[9px] w-fit">
+                              <Check className="h-3 w-3 shrink-0" />
+                              <span className="font-mono">{item.matchedProductId}</span>
+                            </div>
+                            {(item as any).matchedProductName && (
+                              <p className="text-[8px] text-slate-500 pl-1 line-clamp-1">{(item as any).matchedProductName}</p>
+                            )}
                           </div>
                         ) : (
-                          <div className="flex items-center gap-1">
-                            <span className="text-[9px] text-amber-700 bg-amber-50 px-1 rounded">No match</span>
-                            <button
-                              onClick={() => handleCreateNewProduct(index)}
-                              title="Create new product"
-                              className="p-0.5 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded cursor-pointer"
-                            >
-                              <Plus className="h-3 w-3 text-emerald-600" />
-                            </button>
+                          <div className="space-y-1">
+                            <div className="flex items-center gap-1">
+                              <span className="text-[9px] text-amber-700 bg-amber-50 border border-amber-200 px-1 py-0.5 rounded">No match</span>
+                              <button
+                                onClick={() => handleCreateNewProduct(index)}
+                                title="Create as new product"
+                                className="p-0.5 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded cursor-pointer"
+                              >
+                                <Plus className="h-3 w-3 text-emerald-600" />
+                              </button>
+                            </div>
+                            {/* Manual barcode entry */}
+                            <input
+                              type="text"
+                              placeholder="Enter barcode manually..."
+                              className="w-full text-[9px] font-mono p-0.5 border border-slate-200 rounded focus:border-emerald-500 focus:outline-none bg-white"
+                              onChange={(e) => {
+                                if (e.target.value.length > 4) {
+                                  handleUpdateItemField(index, "matchedProductId", e.target.value);
+                                  handleUpdateItemField(index, "code", e.target.value);
+                                }
+                              }}
+                            />
                           </div>
                         )}
                       </td>
+
+                      {/* PRODUCT NAME */}
                       <td className="p-1 px-2">
                         <input type="text" className="bg-transparent border-b border-transparent hover:border-slate-300 focus:border-emerald-500 focus:outline-none p-0 text-[10px] font-bold text-slate-800 w-full" value={item.name} onChange={(e) => handleUpdateItemField(index, "name", e.target.value)} />
                       </td>
+
+                      {/* BARCODE / CODE */}
                       <td className="p-1 px-2">
                         <input type="text" className="bg-transparent border-b border-transparent hover:border-slate-300 focus:border-emerald-500 focus:outline-none p-0 text-[9px] font-mono text-slate-400 w-full" value={item.code || ""} onChange={(e) => handleUpdateItemField(index, "code", e.target.value)} placeholder="N/A" />
                       </td>
+
+                      {/* QTY */}
                       <td className="p-1 px-2 text-center">
                         <input type="number" className="bg-transparent border-b border-transparent hover:border-slate-300 focus:border-emerald-500 focus:outline-none p-0 text-[10px] text-slate-800 w-full text-center font-bold" value={item.quantity} onChange={(e) => handleUpdateItemField(index, "quantity", parseInt(e.target.value) || 0)} />
                       </td>
+
+                      {/* UNIT PRICE */}
                       <td className="p-1 px-2">
                         <div className="relative">
                           <span className="absolute left-0 bottom-0 text-[9px] text-slate-400">$</span>
@@ -617,18 +602,25 @@ Rules:
             </div>
           </div>
 
-          <div className="flex justify-end gap-2 pt-2 border-t border-slate-200">
-            <button onClick={() => setStatus("idle")} className="px-2.5 py-1 border border-slate-200 hover:bg-slate-50 text-slate-600 text-[10px] font-semibold rounded cursor-pointer">
-              Back
-            </button>
-            <button
-              onClick={handleConfirmReviewSubmit}
-              disabled={!selectedRepId}
-              className="px-3 py-1 bg-emerald-700 hover:bg-emerald-800 disabled:bg-slate-200 disabled:text-slate-400 text-white text-[10px] font-bold rounded cursor-pointer flex items-center gap-1"
-            >
-              <UserCheck className="h-3.5 w-3.5" />
-              <span>Confirm &amp; Save Prices</span>
-            </button>
+          <div className="flex justify-between items-center pt-2 border-t border-slate-200">
+            <p className="text-[9px] text-slate-400">
+              {totalCount - matchedCount > 0
+                ? `${totalCount - matchedCount} unmatched products will be created as new in the database`
+                : "All products matched — ready to save"}
+            </p>
+            <div className="flex gap-2">
+              <button onClick={() => setStatus("idle")} className="px-2.5 py-1 border border-slate-200 hover:bg-slate-50 text-slate-600 text-[10px] font-semibold rounded cursor-pointer">
+                Back
+              </button>
+              <button
+                onClick={handleConfirmReviewSubmit}
+                disabled={!selectedRepId}
+                className="px-3 py-1 bg-emerald-700 hover:bg-emerald-800 disabled:bg-slate-200 disabled:text-slate-400 text-white text-[10px] font-bold rounded cursor-pointer flex items-center gap-1"
+              >
+                <UserCheck className="h-3.5 w-3.5" />
+                <span>Confirm &amp; Save Prices</span>
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -653,7 +645,7 @@ Rules:
             <p className="text-[10px] text-slate-500 mt-0.5">All prices saved. Rep created if new. Price history updated.</p>
           </div>
           <button
-            onClick={() => { setFile(null); setExtractedData(null); setStatus("idle"); onScanConfirmed(); }}
+            onClick={() => { setFile(null); setExtractedData(null); setStatus("idle"); setMatchingProgress(""); onScanConfirmed(); }}
             className="px-3 py-1 bg-slate-900 hover:bg-slate-800 text-white text-[10px] font-semibold rounded cursor-pointer"
           >
             Scan Another Docket

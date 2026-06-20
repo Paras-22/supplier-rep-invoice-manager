@@ -35,6 +35,9 @@ export interface PriceEntry {
   productId: string;
   repId: string;
   price: number;
+  packQuantity?: number;
+  unitPrice?: number;
+  discPercent?: number;
   packSize?: string;
   effectiveDate: any;
   invoiceId?: string;
@@ -48,6 +51,9 @@ export interface InvoiceItem {
   code?: string | null;
   quantity: number;
   price: number;
+  packQuantity?: number;
+  unitPrice?: number;
+  discPercent?: number;
   matchedProductId?: string | null;
   matchedProductName?: string | null;
 }

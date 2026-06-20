@@ -21,7 +21,7 @@ export default function RepDirectory({ reps, visits, products, priceEntries, inv
   const [copiedOrder, setCopiedOrder] = useState(false);
   const [showPrintReport, setShowPrintReport] = useState(false);
   const [activeTab, setActiveTab] = useState<"products" | "visits" | "notepad" | "order">("products");
-
+  const [expandedProductId, setExpandedProductId] = useState<string | null>(null);
   // Add rep state
   const [newName, setNewName] = useState("");
   const [newCompany, setNewCompany] = useState("");
@@ -125,9 +125,11 @@ export default function RepDirectory({ reps, visits, products, priceEntries, inv
     return suppliedProducts.filter(p => p.name.toLowerCase().includes(q));
   }, [suppliedProducts, repProductSearch]);
 
-  // Get current and previous prices per product for this rep
+  // Get current and previous prices per product for this rep.
+  // packQuantity, unitPrice, and discPercent are passed through exactly as
+  // extracted/computed in DocketScanner.tsx — no calculation happens here.
   const productPriceData = useMemo(() => {
-    const data: { [productId: string]: { current: number; previous: number | null; change: number | null; changePct: number | null } } = {};
+    const data: { [productId: string]: { current: number; previous: number | null; change: number | null; changePct: number | null; packQuantity: number | null; unitPrice: number | null; discPercent: number | null; effectiveDate: any } } = {};
 
     repSuppliedProductIds.forEach(productId => {
       const entries = priceEntries
@@ -144,8 +146,12 @@ export default function RepDirectory({ reps, visits, products, priceEntries, inv
       const previous = entries.length > 1 ? entries[1].price : null;
       const change = previous !== null ? current - previous : null;
       const changePct = previous !== null && previous > 0 ? ((current - previous) / previous) * 100 : null;
+      const packQuantity = entries[0].packQuantity ?? null;
+      const unitPrice = (entries[0] as any).unitPrice ?? null;
+      const discPercent = (entries[0] as any).discPercent ?? null;
+      const effectiveDate = entries[0].effectiveDate;
 
-      data[productId] = { current, previous, change, changePct };
+      data[productId] = { current, previous, change, changePct, packQuantity, unitPrice, discPercent, effectiveDate };
     });
 
     return data;
@@ -587,7 +593,9 @@ export default function RepDirectory({ reps, visits, products, priceEntries, inv
                         <thead className="bg-slate-50 sticky top-0 z-10">
                           <tr className="text-slate-500 font-bold uppercase text-[8px] border-b border-slate-200">
                             <th className="p-1.5 px-2">Product</th>
-                            <th className="p-1.5 px-2 text-right">Current Price</th>
+                            <th className="p-1.5 px-2 text-right">Box Price</th>
+                            <th className="p-1.5 px-2 text-center">Units/Box</th>
+                            <th className="p-1.5 px-2 text-right">Per Unit</th>
                             <th className="p-1.5 px-2 text-right">Previous</th>
                             <th className="p-1.5 px-2 text-center">Change</th>
                             <th className="p-1.5 px-2 text-center">Status</th>
@@ -596,32 +604,72 @@ export default function RepDirectory({ reps, visits, products, priceEntries, inv
                         <tbody className="divide-y divide-slate-100">
                           {filteredSuppliedProducts.map(p => {
                             const pd = productPriceData[p.id];
+                            const isExpanded = expandedProductId === p.id;
+                            const hasAuditTrail = pd?.unitPrice != null;
+                            const isFreePromo = (pd?.discPercent ?? 0) >= 100;
                             return (
-                              <tr key={p.id} className="hover:bg-slate-50/50">
-                                <td className="p-1.5 px-2">
-                                  <p className="font-semibold text-slate-800 line-clamp-1">{p.name}</p>
-                                  <p className="text-[8px] text-slate-400 font-mono">{p.id}</p>
-                                </td>
-                                <td className="p-1.5 px-2 text-right font-bold font-mono text-slate-800">
-                                  ${pd?.current?.toFixed(2) || "—"}
-                                </td>
-                                <td className="p-1.5 px-2 text-right font-mono text-slate-400">
-                                  {pd?.previous ? `$${pd.previous.toFixed(2)}` : "—"}
-                                </td>
-                                <td className="p-1.5 px-2 text-center">
-                                  <div className="flex items-center justify-center gap-1">
-                                    {priceChangeIcon(pd?.change ?? null)}
-                                    {priceChangeLabel(pd?.change ?? null, pd?.changePct ?? null)}
-                                  </div>
-                                </td>
-                                <td className="p-1.5 px-2 text-center">
-                                  {p.lowStock && (
-                                    <span className="text-[8px] bg-rose-50 text-rose-700 border border-rose-200 px-1 py-0.5 rounded font-bold flex items-center gap-0.5 justify-center">
-                                      <AlertIcon className="h-2.5 w-2.5" />LOW
-                                    </span>
-                                  )}
-                                </td>
-                              </tr>
+                              <React.Fragment key={p.id}>
+                                <tr className="hover:bg-slate-50/50">
+                                  <td className="p-1.5 px-2">
+                                    <p className="font-semibold text-slate-800 line-clamp-1">{p.name}</p>
+                                    <p className="text-[8px] text-slate-400 font-mono">{p.id}</p>
+                                  </td>
+                                  <td className="p-1.5 px-2 text-right font-bold font-mono text-slate-800">
+                                    <div className="flex items-center justify-end gap-1">
+                                      <span className={isFreePromo ? "text-amber-700" : ""}>${pd?.current?.toFixed(2) || "—"}</span>
+                                      {hasAuditTrail && (
+                                        <button
+                                          onClick={() => setExpandedProductId(isExpanded ? null : p.id)}
+                                          title="Show how this price was calculated"
+                                          className="text-slate-400 hover:text-emerald-600 cursor-pointer"
+                                        >
+                                          <CalcIcon className="h-2.5 w-2.5" />
+                                        </button>
+                                      )}
+                                    </div>
+                                  </td>
+                                  <td className="p-1.5 px-2 text-center font-bold font-mono text-amber-700">
+                                    {pd?.packQuantity ?? "—"}
+                                  </td>
+                                  <td className="p-1.5 px-2 text-right font-bold font-mono text-emerald-700">
+                                    {pd?.current && pd?.packQuantity
+                                      ? `$${(pd.current / pd.packQuantity).toFixed(2)}`
+                                      : "—"}
+                                  </td>
+                                  <td className="p-1.5 px-2 text-right font-mono text-slate-400">
+                                    {pd?.previous ? `$${pd.previous.toFixed(2)}` : "—"}
+                                  </td>
+                                  <td className="p-1.5 px-2 text-center">
+                                    <div className="flex items-center justify-center gap-1">
+                                      {priceChangeIcon(pd?.change ?? null)}
+                                      {priceChangeLabel(pd?.change ?? null, pd?.changePct ?? null)}
+                                    </div>
+                                  </td>
+                                  <td className="p-1.5 px-2 text-center">
+                                    {p.lowStock && (
+                                      <span className="text-[8px] bg-rose-50 text-rose-700 border border-rose-200 px-1 py-0.5 rounded font-bold flex items-center gap-0.5 justify-center">
+                                        <AlertIcon className="h-2.5 w-2.5" />LOW
+                                      </span>
+                                    )}
+                                  </td>
+                                </tr>
+                                {isExpanded && hasAuditTrail && (
+                                  <tr className={isFreePromo ? "bg-amber-50" : "bg-emerald-50/40"}>
+                                    <td colSpan={7} className={`p-1.5 px-2 text-[9px] ${isFreePromo ? "text-amber-800" : "text-emerald-800"}`}>
+                                      <span className="font-bold">From docket:</span>{" "}
+                                      ${pd!.unitPrice!.toFixed(2)} unit price × (1 − {pd!.discPercent ?? 0}% disc) = ${pd!.current?.toFixed(2)} box price
+                                      {isFreePromo && (
+                                        <span className="ml-1.5 font-bold">— 100% discount, likely free/promo. Do not use for retail pricing.</span>
+                                      )}
+                                      {pd?.effectiveDate && (
+                                        <span className={`ml-2 ${isFreePromo ? "text-amber-600" : "text-emerald-600"}`}>
+                                          · Scanned {new Date(pd.effectiveDate?.seconds ? pd.effectiveDate.seconds * 1000 : pd.effectiveDate).toLocaleDateString()}
+                                        </span>
+                                      )}
+                                    </td>
+                                  </tr>
+                                )}
+                              </React.Fragment>
                             );
                           })}
                         </tbody>

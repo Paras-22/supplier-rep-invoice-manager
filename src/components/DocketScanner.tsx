@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { FileUp, Receipt, Check, Loader2, AlertCircle, ShoppingBag, UserCheck, Plus, Sparkles, RefreshCw, Edit2 } from "lucide-react";
+import { FileUp, Receipt, Check, Loader2, AlertCircle, ShoppingBag, UserCheck, Plus, Sparkles, RefreshCw, Edit2, Gift } from "lucide-react";
 import { collection, doc, setDoc, updateDoc, serverTimestamp, query, where, getDocs, limit, or } from "firebase/firestore";
 import { db, handleFirestoreError, OperationType } from "../firebase";
 import { Rep, Invoice, InvoiceItem } from "../types";
@@ -119,10 +119,6 @@ export default function DocketScanner({ reps, onScanConfirmed, currentUserUid }:
   // Finds an existing rep by NORMALIZED company-name match (handles legal
   // suffix variations like "Ltd" vs "Wholesalers & Distributors" referring
   // to the same supplier), or creates a new one if truly no match exists.
-  // Also accepts phone/email extracted from the docket:
-  // - If creating a new rep, phone/email are filled in immediately.
-  // - If the rep already exists but is missing phone/email, this patches
-  //   those fields in rather than leaving them blank forever.
   const findOrCreateRep = async (
     supplierName: string,
     repName: string | null,
@@ -193,8 +189,10 @@ Extract and return ONLY a valid JSON object with no markdown, no explanation:
     {
       "name": "full expanded standardised product name in UPPERCASE English",
       "code": "supplier product code if visible, otherwise null",
-      "quantity": quantity ordered as whole number,
-      "price": unit price as decimal number
+      "quantity": quantity ordered as whole number (number of cases/cartons, NOT individual units),
+      "unitPrice": the PRE-DISCOUNT box/case price exactly as printed in the docket's "Price" or "Unit Price" column for this line, as a decimal number. Do NOT apply any discount to this number — extract it exactly as printed,
+      "discPercent": the discount percentage exactly as printed in the docket's "Disc%" or "Disc." column for this line, as a plain number (e.g. 13 for "13%", 100 for "100%", 0 if no discount column or blank/0% shown for this line),
+      "packQuantity": the number of individual units inside one case/carton/box for this line, as a whole number
     }
   ]
 }
@@ -203,13 +201,13 @@ Critical rules:
 - ALL product names in UPPERCASE
 - Expand ALL abbreviations: Msshi→MUSASHI, Shrd→SHREDDED, Enrgy→ENERGY, Rasp→RASPBERRY, Lm→LEMON, P/Fruit→PASSIONFRUIT, Choc→CHOCOLATE, Straw→STRAWBERRY, Van→VANILLA, B/B→BIG BANG
 - Include: Brand + Product Type + Size/Volume + Flavour
-- Remove pack multipliers (x12, x24, 12pk, per carton) from name
-- Numbers in brackets (24) (12) = carton size, remove from name
-- Keep product size like 375ML, 500ML, 130G in name
-- price = UNIT PRICE column value
-- quantity = QTY column value as integer
-- repPhone and repEmail can belong to a named contact person on the docket even if that person is not explicitly labelled "rep" — use your judgement based on context (e.g. a name with a phone number and/or email near the supplier letterhead)
-- If multiple contact names with phone numbers are listed (e.g. several reps for the same company), pick the one that most likely corresponds to repName, or the first one listed if repName is null
+- Remove pack multipliers (x12, X24, *12, 12pk, per carton, x10/pack) from the NAME field only — but capture that exact number in "packQuantity" instead of discarding it. These multipliers can appear anywhere in the description, with x, X, or * as the separator, in brackets or not, in any position (e.g. "DRAGON COOL BANANA SPRAY (9)" → packQuantity 9, "MUSASHI ENERGY MANGO 500ML 12PK" → packQuantity 12, "KOBI SALTED PEANUTS 130GX24CTN" → packQuantity 24)
+- If no pack size number is visible anywhere for a line (e.g. loose produce, single units), set "packQuantity" to 1
+- Keep product size like 375ML, 500ML, 130G, 43G, 26G in the name
+- "unitPrice" must be the PRE-discount box/case price column exactly as printed — never the final/extended/total/amount column, and never with any discount already applied
+- "discPercent" must be the discount percentage column exactly as printed, as a plain number with no % sign (e.g. write 24, not "24%"). If the docket has no discount column at all, or shows 0% for this line, use 0
+- quantity = QTY column value as integer (number of cases/cartons ordered, not units inside)
+- repPhone and repEmail can belong to a named contact person on the docket even if that person is not explicitly labelled "rep" — use your judgement based on context (e.g. a name with a phone number and/or email near the supplier letterhead). If multiple contacts are listed, prefer the one matching repName, otherwise the first one listed
 - Return only JSON, nothing else`;
 
       const ocrRaw = await callGemini(ocrPrompt, { mime_type: mimeType, data: base64 });
@@ -311,20 +309,43 @@ Return ONLY a JSON array, no markdown:
         matchResults = [];
       }
 
-      // Build final items — only accept high/medium confidence matches
+      // Build final items — only accept high/medium confidence matches.
+      // Box price is computed here, deterministically, from two numbers
+      // Gemini extracted exactly as printed (unitPrice and discPercent) —
+      // no LLM reasoning happens in this calculation, only plain arithmetic:
+      // boxPrice = unitPrice × (1 − discPercent / 100)
       const matchedItems: InvoiceItem[] = items.map((item: any, index: number) => {
         const match = matchResults.find((r: any) => r.productIndex === index + 1);
         const acceptMatch = match?.matchedId && match.confidence !== "low" && match.confidence !== "none";
         const candidate = acceptMatch ? candidateMap.get(match!.matchedId!) : null;
 
+        const rawUnitPrice = typeof item.unitPrice === "number" ? item.unitPrice : parseFloat(item.unitPrice);
+        const unitPrice = !isNaN(rawUnitPrice) ? rawUnitPrice : 0;
+
+        const rawDiscPercent = typeof item.discPercent === "number" ? item.discPercent : parseFloat(item.discPercent);
+        const discPercent = !isNaN(rawDiscPercent) ? Math.max(0, Math.min(100, rawDiscPercent)) : 0;
+
+        const boxPrice = unitPrice * (1 - discPercent / 100);
+
+        const rawQty = parseInt(item.quantity);
+        const quantity = !isNaN(rawQty) && rawQty > 0 ? rawQty : 1;
+
+        const rawPackQty = parseInt(item.packQuantity);
+        const packQuantity = !isNaN(rawPackQty) && rawPackQty > 0 ? rawPackQty : 1;
+
         return {
           name: item.name,
           code: item.code || null,
-          quantity: item.quantity || 1,
-          price: item.price || 0,
+          quantity,
+          price: Math.round(boxPrice * 100) / 100,
+          packQuantity,
+          // Kept for reference/verification — not used in any further
+          // calculation beyond the one boxPrice computation above.
+          unitPrice,
+          discPercent,
           matchedProductId: acceptMatch ? match!.matchedId! : "",
           matchedProductName: candidate?.name || ""
-        };
+        } as any;
       });
 
       // ── STEP 4: Find or create rep ─────────────────────────────────────
@@ -375,6 +396,16 @@ Return ONLY a JSON array, no markdown:
     if (!extractedData) return;
     const itemsCopy = [...extractedData.items];
     itemsCopy[index] = { ...itemsCopy[index], [field]: value };
+
+    // If the manager edits unitPrice or discPercent directly, recompute the
+    // box price live so what gets saved always matches what's displayed.
+    if (field === ("unitPrice" as any) || field === ("discPercent" as any)) {
+      const up = field === ("unitPrice" as any) ? value : (itemsCopy[index] as any).unitPrice;
+      const dp = field === ("discPercent" as any) ? value : (itemsCopy[index] as any).discPercent;
+      const recomputed = (up || 0) * (1 - (dp || 0) / 100);
+      itemsCopy[index] = { ...itemsCopy[index], price: Math.round(recomputed * 100) / 100 };
+    }
+
     setExtractedData({ ...extractedData, items: itemsCopy });
   };
 
@@ -428,13 +459,18 @@ Return ONLY a JSON array, no markdown:
           productId = autoId;
         }
 
+        const packQty = (item as any).packQuantity && (item as any).packQuantity > 0 ? (item as any).packQuantity : 1;
+
         const priceRef = doc(collection(db, "prices"));
         await setDoc(priceRef, {
           id: priceRef.id,
           productId,
           repId: selectedRepId,
           price: item.price,
-          packSize: `Qty ${item.quantity}`,
+          packQuantity: packQty,
+          unitPrice: (item as any).unitPrice ?? null,
+          discPercent: (item as any).discPercent ?? 0,
+          packSize: `Qty ${item.quantity} x ${packQty}/box`,
           effectiveDate: isNaN(Date.parse(extractedData.invoiceDate))
             ? serverTimestamp()
             : new Date(extractedData.invoiceDate),
@@ -578,6 +614,10 @@ Return ONLY a JSON array, no markdown:
             </div>
           )}
 
+          <div className="p-2 bg-emerald-50/60 border border-emerald-200 rounded text-[10px] text-emerald-800 leading-relaxed">
+            <strong>Box Price = Unit Price × (1 − Disc%).</strong> Both numbers are extracted exactly as printed and the discount is applied automatically. Lines with a 100% discount are flagged in amber — these are usually free/promo items and the $0.00 box price should NOT be used for retail pricing decisions.
+          </div>
+
           <div className="space-y-1.5">
             <div className="flex items-center justify-between">
               <h3 className="text-[11px] font-bold text-slate-700 flex items-center gap-1">
@@ -600,11 +640,17 @@ Return ONLY a JSON array, no markdown:
                     <th className="p-1 px-2 w-24">Barcode / Code</th>
                     <th className="p-1 px-2 w-12 text-center">Qty</th>
                     <th className="p-1 px-2 w-20">Unit Price ($)</th>
+                    <th className="p-1 px-2 w-16 text-center">Disc %</th>
+                    <th className="p-1 px-2 w-20 text-right">Box Price ($)</th>
+                    <th className="p-1 px-2 w-16 text-center">Units/Box</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {extractedData.items.map((item, index) => (
-                    <tr key={index} className={`hover:bg-slate-50/50 ${item.matchedProductId ? "" : "bg-amber-50/30"}`}>
+                  {extractedData.items.map((item, index) => {
+                    const discPercent = (item as any).discPercent ?? 0;
+                    const isFreePromo = discPercent >= 100;
+                    return (
+                    <tr key={index} className={`hover:bg-slate-50/50 ${item.matchedProductId ? "" : "bg-amber-50/30"} ${isFreePromo ? "bg-amber-50" : ""}`}>
 
                       {/* DATABASE MATCH COLUMN */}
                       <td className="p-1 px-2 min-w-[160px]">
@@ -649,6 +695,12 @@ Return ONLY a JSON array, no markdown:
                       {/* PRODUCT NAME */}
                       <td className="p-1 px-2">
                         <input type="text" className="bg-transparent border-b border-transparent hover:border-slate-300 focus:border-emerald-500 focus:outline-none p-0 text-[10px] font-bold text-slate-800 w-full" value={item.name} onChange={(e) => handleUpdateItemField(index, "name", e.target.value)} />
+                        {isFreePromo && (
+                          <span className="inline-flex items-center gap-0.5 mt-0.5 text-[8px] font-bold text-amber-700 bg-amber-100 px-1 py-0.5 rounded">
+                            <Gift className="h-2.5 w-2.5" />
+                            Free/Promo — verify before using for pricing
+                          </span>
+                        )}
                       </td>
 
                       {/* BARCODE / CODE */}
@@ -661,18 +713,55 @@ Return ONLY a JSON array, no markdown:
                         <input type="number" className="bg-transparent border-b border-transparent hover:border-slate-300 focus:border-emerald-500 focus:outline-none p-0 text-[10px] text-slate-800 w-full text-center font-bold" value={item.quantity} onChange={(e) => handleUpdateItemField(index, "quantity", parseInt(e.target.value) || 0)} />
                       </td>
 
-                      {/* UNIT PRICE */}
+                      {/* UNIT PRICE — pre-discount, editable */}
                       <td className="p-1 px-2">
                         <div className="relative">
                           <span className="absolute left-0 bottom-0 text-[9px] text-slate-400">$</span>
-                          <input type="number" step="0.01" className="bg-transparent border-b border-transparent hover:border-slate-300 focus:border-emerald-500 focus:outline-none p-0 pl-2.5 text-[10px] w-full font-bold text-slate-800" value={item.price} onChange={(e) => handleUpdateItemField(index, "price", parseFloat(e.target.value) || 0)} />
+                          <input
+                            type="number" step="0.01"
+                            className="bg-transparent border-b border-transparent hover:border-slate-300 focus:border-emerald-500 focus:outline-none p-0 pl-2.5 text-[10px] w-full font-bold text-slate-800"
+                            value={(item as any).unitPrice ?? 0}
+                            onChange={(e) => handleUpdateItemField(index, "unitPrice" as any, parseFloat(e.target.value) || 0)}
+                          />
                         </div>
                       </td>
+
+                      {/* DISC % — editable */}
+                      <td className="p-1 px-2 text-center">
+                        <input
+                          type="number" min="0" max="100" step="0.01"
+                          className={`bg-transparent border-b ${isFreePromo ? "border-amber-300 text-amber-700" : "border-transparent text-slate-800"} hover:border-slate-300 focus:border-emerald-500 focus:outline-none p-0 text-[10px] w-full text-center font-bold`}
+                          value={discPercent}
+                          onChange={(e) => handleUpdateItemField(index, "discPercent" as any, parseFloat(e.target.value) || 0)}
+                        />
+                      </td>
+
+                      {/* BOX PRICE — computed, read-only */}
+                      <td className="p-1 px-2 text-right">
+                        <span className={`text-[10px] font-bold font-mono ${isFreePromo ? "text-amber-700" : "text-emerald-700"}`}>
+                          ${item.price.toFixed(2)}
+                        </span>
+                      </td>
+
+                      {/* UNITS PER BOX — editable, pre-filled from OCR */}
+                      <td className="p-1 px-2 text-center">
+                        <input
+                          type="number"
+                          min="1"
+                          title="Number of individual units inside one box/carton, as printed on the docket"
+                          className="bg-amber-50/60 border border-amber-200 hover:border-amber-300 focus:border-emerald-500 focus:outline-none p-0.5 text-[10px] text-slate-800 w-full text-center font-bold rounded"
+                          value={(item as any).packQuantity ?? 1}
+                          onChange={(e) => handleUpdateItemField(index, "packQuantity" as any, parseInt(e.target.value) || 1)}
+                        />
+                      </td>
                     </tr>
-                  ))}
+                  );})}
                 </tbody>
               </table>
             </div>
+            <p className="text-[9px] text-slate-400 pl-1">
+              Box Price is calculated automatically as Unit Price × (1 − Disc%). Edit Unit Price or Disc% to correct a misread, and Box Price updates live. Units/Box is extracted as printed — divide Box Price by Units/Box yourself for per-unit cost.
+            </p>
           </div>
 
           <div className="flex justify-between items-center pt-2 border-t border-slate-200">

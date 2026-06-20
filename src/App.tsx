@@ -1,6 +1,6 @@
 import { useState, useEffect, FormEvent } from "react";
 import { onAuthStateChanged, signInWithPopup, signOut, User, signInWithEmailAndPassword, createUserWithEmailAndPassword, updateProfile } from "firebase/auth";
-import { collection, onSnapshot, getDocs, doc, getDoc, setDoc, updateDoc, serverTimestamp, query, where } from "firebase/firestore";
+import { collection, onSnapshot, getDocs, doc, getDoc, setDoc, updateDoc, serverTimestamp, query, where, documentId } from "firebase/firestore";
 import { auth, db, googleProvider, testConnection, handleFirestoreError, OperationType } from "./firebase";
 import { Product, Rep, PriceEntry, Invoice, Visit } from "./types";
 import POSImport from "./components/POSImport";
@@ -29,6 +29,11 @@ export default function App() {
   const [invoices, setInvoices] = useState<Invoice[]>([]);
   const [allVisits, setAllVisits] = useState<Visit[]>([]);
   const [lowStockProducts, setLowStockProducts] = useState<Product[]>([]);
+  // NEW: holds only the products that are actually referenced by priceEntries
+  // (i.e. products that have been scanned/quoted by a rep at least once).
+  // This is intentionally NOT the full ~13,000 product catalog — that stays
+  // lazy-loaded via on-demand search in ProductCatalog.tsx for performance.
+  const [products, setProducts] = useState<Product[]>([]);
 
   useEffect(() => {
     testConnection();
@@ -142,6 +147,45 @@ export default function App() {
     };
     fetchAllVisits();
   }, [currentUser, reps, priceEntries]);
+
+  // NEW: Fetch only the product docs referenced by priceEntries.
+  // Without this, RepDirectory and POSImport never see any real product
+  // data (they were previously hardcoded to receive an empty array),
+  // even though the products exist in Firestore.
+  // Firestore "in" queries support max 30 values per query, so we batch.
+  useEffect(() => {
+    if (!currentUser) return;
+
+    const referencedIds = Array.from(new Set(priceEntries.map(p => p.productId).filter(Boolean)));
+
+    if (referencedIds.length === 0) {
+      setProducts([]);
+      return;
+    }
+
+    const fetchReferencedProducts = async () => {
+      try {
+        const BATCH_SIZE = 30;
+        const fetchedMap: { [id: string]: Product } = {};
+
+        for (let i = 0; i < referencedIds.length; i += BATCH_SIZE) {
+          const batchIds = referencedIds.slice(i, i + BATCH_SIZE);
+          const snap = await getDocs(
+            query(collection(db, "products"), where(documentId(), "in", batchIds))
+          );
+          snap.forEach(d => {
+            fetchedMap[d.id] = { id: d.id, ...d.data() } as Product;
+          });
+        }
+
+        setProducts(Object.values(fetchedMap));
+      } catch (err) {
+        console.error("Failed to fetch referenced products:", err);
+      }
+    };
+
+    fetchReferencedProducts();
+  }, [currentUser, priceEntries]);
 
   const handleEmailAuthSubmit = async (e: FormEvent) => {
     e.preventDefault();
@@ -263,6 +307,7 @@ export default function App() {
     setPriceEntries([]);
     setInvoices([]);
     setLowStockProducts([]);
+    setProducts([]);
   };
 
   if (authLoading) {
@@ -414,10 +459,10 @@ export default function App() {
             exit={{ opacity: 0, y: -5 }}
             transition={{ duration: 0.1 }}
           >
-            {activeTab === "scan" && <DocketScanner reps={reps} products={[]} onScanConfirmed={() => setActiveTab("catalog")} currentUserUid={currentUser.uid} />}
+            {activeTab === "scan" && <DocketScanner reps={reps} products={products as any} onScanConfirmed={() => setActiveTab("catalog")} currentUserUid={currentUser.uid} />}
             {activeTab === "catalog" && <ProductCatalog reps={reps} priceEntries={priceEntries} currentUserUid={currentUser.uid} />}
-            {activeTab === "reps" && <RepDirectory reps={reps} visits={allVisits} products={[]} priceEntries={priceEntries} invoices={invoices} onRepChange={() => {}} currentUserUid={currentUser.uid} />}
-            {activeTab === "pos-import" && <POSImport onImportComplete={() => setActiveTab("catalog")} existingProductIds={[]} />}
+            {activeTab === "reps" && <RepDirectory reps={reps} visits={allVisits} products={products} priceEntries={priceEntries} invoices={invoices} onRepChange={() => {}} currentUserUid={currentUser.uid} />}
+            {activeTab === "pos-import" && <POSImport onImportComplete={() => setActiveTab("catalog")} existingProductIds={products.map(p => p.id)} />}
             {activeTab === "alerts" && <LowStockAlerts products={lowStockProducts} reps={reps} currentUserUid={currentUser.uid} onNavigateToCatalog={() => setActiveTab("catalog")} />}
           </motion.div>
         </AnimatePresence>

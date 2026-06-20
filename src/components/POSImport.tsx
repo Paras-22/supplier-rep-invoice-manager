@@ -1,12 +1,15 @@
 import React, { useState, useMemo } from "react";
 import { Upload, FileText, CheckCircle2, AlertCircle, Info, Loader2 as LoaderIcon, Database, ArrowRight } from "lucide-react";
-import { doc, writeBatch, serverTimestamp } from "firebase/firestore";
+import { doc, writeBatch, serverTimestamp, collection, query, where, documentId, getDocs } from "firebase/firestore";
 import { db } from "../firebase";
 import { motion } from "motion/react";
 
 interface POSImportProps {
   onImportComplete: () => void;
-  existingProductIds: string[];
+  // Kept for backwards compatibility with App.tsx, but no longer relied on
+  // for duplicate detection — see handleExecuteImport, which checks Firestore
+  // directly for the specific candidate IDs being imported right now.
+  existingProductIds?: string[];
 }
 
 export interface PreviewProduct {
@@ -16,13 +19,18 @@ export interface PreviewProduct {
   category: string;
 }
 
-export default function POSImport({ onImportComplete, existingProductIds }: POSImportProps) {
+export default function POSImport({ onImportComplete }: POSImportProps) {
   const [csvText, setCsvText] = useState("");
   const [previewProducts, setPreviewProducts] = useState<PreviewProduct[]>([]);
-  const [status, setStatus] = useState<"idle" | "parsed" | "processing" | "success" | "error">("idle");
+  const [status, setStatus] = useState<"idle" | "parsed" | "checking" | "processing" | "success" | "error">("idle");
   const [log, setLog] = useState<string[]>([]);
   const [errorDetails, setErrorDetails] = useState("");
   const [importStats, setImportStats] = useState({ saved: 0, skippedDuplicates: 0, failed: 0 });
+  // Set of IDs (from previewProducts) confirmed to already exist in Firestore.
+  // Populated by checkExistingIds() right before import, and used to render
+  // accurate "Duplicate" badges in the preview table.
+  const [confirmedDuplicateIds, setConfirmedDuplicateIds] = useState<Set<string>>(new Set());
+  const [duplicateCheckDone, setDuplicateCheckDone] = useState(false);
 
   const handleSampleLoad = () => {
     const sample = `Barcode,Product Name,Category\n94002624,Coca-Cola Can 330ml,Beverages\n94157670,Blue Powerade 750ml,Beverages\n94142312,Tip Top Jelly Tip Ice Cream,Frozen\n94192000,Anchor Blue Milk 2L,Dairy\n94030012,Watties Baked Beans 420g,Canned Goods\n94150077,Arnotts Chicken Crimpy 175g,Snacks\n,Loose Red Tomatoes,Fresh Produce\n,Bulk Crown Pumpkin,Fresh Produce`;
@@ -166,6 +174,8 @@ export default function POSImport({ onImportComplete, existingProductIds }: POSI
       }
 
       setPreviewProducts(candidates);
+      setConfirmedDuplicateIds(new Set());
+      setDuplicateCheckDone(false);
       setStatus("parsed");
       setLog([
         `Parsed successfully. Compiled ${candidates.length} products ready for import.`,
@@ -178,6 +188,47 @@ export default function POSImport({ onImportComplete, existingProductIds }: POSI
     }
   };
 
+  // Checks Firestore directly for exactly the IDs in this CSV — chunked by 30
+  // (Firestore "in" query limit). This scales correctly regardless of how
+  // large the overall product catalog is, since we never load the whole
+  // collection — only ask "do these specific IDs exist?"
+  const checkExistingIds = async (ids: string[]): Promise<Set<string>> => {
+    const found = new Set<string>();
+    const BATCH_SIZE = 30;
+
+    for (let i = 0; i < ids.length; i += BATCH_SIZE) {
+      const batchIds = ids.slice(i, i + BATCH_SIZE);
+      const snap = await getDocs(
+        query(collection(db, "products"), where(documentId(), "in", batchIds))
+      );
+      snap.forEach(d => found.add(d.id));
+    }
+
+    return found;
+  };
+
+  const handleCheckDuplicates = async () => {
+    setStatus("checking");
+    setLog(["Checking which products already exist in the database..."]);
+    try {
+      const ids = previewProducts.map(p => p.id);
+      const existing = await checkExistingIds(ids);
+      setConfirmedDuplicateIds(existing);
+      setDuplicateCheckDone(true);
+      setStatus("parsed");
+      setLog(prev => [
+        ...prev,
+        `Checked ${ids.length} products against the database.`,
+        `${existing.size} already exist and will be skipped.`,
+        `${ids.length - existing.size} are new.`
+      ]);
+    } catch (err: any) {
+      console.error("Duplicate check error:", err);
+      setStatus("error");
+      setErrorDetails(err.message || "Failed to check for existing products.");
+    }
+  };
+
   const handleExecuteImport = async () => {
     setStatus("processing");
     setLog(["Initializing batch import..."]);
@@ -186,12 +237,16 @@ export default function POSImport({ onImportComplete, existingProductIds }: POSI
     let skipped = 0;
 
     try {
-      const BATCH_SIZE = 500;
-      const newProducts = previewProducts.filter(
-        item => !existingProductIds.includes(item.id)
-      );
+      // Always re-verify duplicates right before writing — covers the case
+      // where the user skipped the explicit check step, and protects against
+      // staleness if anything changed in the DB since parsing.
+      const ids = previewProducts.map(p => p.id);
+      const existingIds = duplicateCheckDone ? confirmedDuplicateIds : await checkExistingIds(ids);
+
+      const newProducts = previewProducts.filter(item => !existingIds.has(item.id));
       skipped = previewProducts.length - newProducts.length;
 
+      const BATCH_SIZE = 500;
       for (let i = 0; i < newProducts.length; i += BATCH_SIZE) {
         const batch = writeBatch(db);
         const chunk = newProducts.slice(i, i + BATCH_SIZE);
@@ -220,7 +275,7 @@ export default function POSImport({ onImportComplete, existingProductIds }: POSI
         ...prev,
         "---------- Import Complete ----------",
         `Saved: ${saved} products.`,
-        skipped > 0 ? `Skipped ${skipped} duplicates.` : "No duplicates found."
+        skipped > 0 ? `Skipped ${skipped} duplicates (already existed).` : "No duplicates found."
       ]);
       setStatus("success");
       onImportComplete();
@@ -250,18 +305,15 @@ export default function POSImport({ onImportComplete, existingProductIds }: POSI
   };
 
   const previewMetrics = useMemo(() => {
-    let duplicateCount = 0;
-    previewProducts.forEach(p => {
-      if (existingProductIds.includes(p.id)) {
-        duplicateCount++;
-      }
-    });
+    const duplicateCount = duplicateCheckDone
+      ? previewProducts.filter(p => confirmedDuplicateIds.has(p.id)).length
+      : 0;
     return {
       total: previewProducts.length,
       duplicates: duplicateCount,
       newToImport: previewProducts.length - duplicateCount
     };
-  }, [previewProducts, existingProductIds]);
+  }, [previewProducts, confirmedDuplicateIds, duplicateCheckDone]);
 
   return (
     <div className="bg-white rounded-md shadow-xs border border-slate-250 p-4">
@@ -291,7 +343,7 @@ export default function POSImport({ onImportComplete, existingProductIds }: POSI
         </div>
       </div>
 
-      {(status === "idle" || status === "parsed") && (
+      {(status === "idle" || status === "parsed" || status === "checking") && (
         <div className="space-y-4">
           <div>
             <label className="block text-[10px] uppercase font-bold text-slate-400 mb-1" htmlFor="csv_text_input">
@@ -338,15 +390,31 @@ export default function POSImport({ onImportComplete, existingProductIds }: POSI
                   <h3 className="text-xs font-bold text-slate-800">CSV Parsing Results</h3>
                   <p className="text-[10px] text-slate-550">
                     Parsed <strong>{previewMetrics.total}</strong> products.{" "}
-                    {previewMetrics.duplicates > 0 && (
+                    {!duplicateCheckDone ? (
+                      <span className="text-amber-700">Run a duplicate check before importing.</span>
+                    ) : previewMetrics.duplicates > 0 ? (
                       <span>
                         (<span className="text-amber-700 font-bold">{previewMetrics.duplicates}</span> duplicates will be skipped).
                       </span>
+                    ) : (
+                      <span className="text-emerald-700">No duplicates found — all new.</span>
                     )}
                   </p>
                 </div>
-                <div className="text-right text-[10px] text-emerald-800 bg-emerald-50 px-2 py-0.5 rounded font-bold">
-                  {previewMetrics.newToImport} New Products
+                <div className="flex items-center gap-2">
+                  {!duplicateCheckDone && (
+                    <button
+                      onClick={handleCheckDuplicates}
+                      className="text-[10px] text-slate-700 bg-slate-100 hover:bg-slate-200 border border-slate-200 px-2 py-1 rounded font-bold cursor-pointer"
+                    >
+                      Check Duplicates
+                    </button>
+                  )}
+                  {duplicateCheckDone && (
+                    <div className="text-right text-[10px] text-emerald-800 bg-emerald-50 px-2 py-0.5 rounded font-bold">
+                      {previewMetrics.newToImport} New Products
+                    </div>
+                  )}
                 </div>
               </div>
 
@@ -361,7 +429,7 @@ export default function POSImport({ onImportComplete, existingProductIds }: POSI
                   </thead>
                   <tbody className="divide-y divide-slate-100">
                     {previewProducts.map((p, idx) => {
-                      const isDuplicate = existingProductIds.includes(p.id);
+                      const isDuplicate = duplicateCheckDone && confirmedDuplicateIds.has(p.id);
                       return (
                         <tr key={idx} className={`hover:bg-slate-50/50 ${isDuplicate ? "bg-amber-50/30 text-slate-450" : ""}`}>
                           <td className="p-2 pl-3 font-mono text-[9px] font-medium">
@@ -393,17 +461,34 @@ export default function POSImport({ onImportComplete, existingProductIds }: POSI
                 <div className="text-[10px] text-slate-600 leading-snug">
                   <p className="font-bold text-slate-800">Ready for Database Import</p>
                   <p>Products will be written in batches of 500 for maximum speed.</p>
+                  {!duplicateCheckDone && (
+                    <p className="text-amber-700 mt-0.5">Duplicate check will run automatically before import if skipped.</p>
+                  )}
                 </div>
                 <button
                   onClick={handleExecuteImport}
                   className="w-full sm:w-auto px-4 py-2 bg-emerald-700 hover:bg-emerald-800 text-white text-[11px] font-bold rounded flex items-center justify-center gap-1.5 transition-all cursor-pointer"
                 >
                   <Database className="h-3.5 w-3.5" />
-                  <span>Import {previewMetrics.newToImport} Products to Database</span>
+                  <span>
+                    {duplicateCheckDone
+                      ? `Import ${previewMetrics.newToImport} Products to Database`
+                      : `Import ${previewMetrics.total} Products to Database`}
+                  </span>
                 </button>
               </div>
             </motion.div>
           )}
+        </div>
+      )}
+
+      {status === "checking" && (
+        <div className="py-6 flex flex-col items-center justify-center space-y-3">
+          <LoaderIcon className="animate-spin h-7 w-7 text-emerald-600" />
+          <div className="text-center">
+            <p className="text-[11px] font-bold text-slate-700">Checking for existing products in Firestore...</p>
+            <p className="text-[9px] text-slate-400 mt-0.5">Querying in batches of 30 by document ID — no full collection scan.</p>
+          </div>
         </div>
       )}
 
@@ -453,6 +538,8 @@ export default function POSImport({ onImportComplete, existingProductIds }: POSI
               onClick={() => {
                 setCsvText("");
                 setPreviewProducts([]);
+                setConfirmedDuplicateIds(new Set());
+                setDuplicateCheckDone(false);
                 setStatus("idle");
               }}
               className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-600 text-[10px] font-bold rounded cursor-pointer border border-slate-200"

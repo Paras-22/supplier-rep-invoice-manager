@@ -39,6 +39,23 @@ const callGemini = async (prompt: string, imagePart?: { mime_type: string; data:
   return raw.replace(/```json|```/g, "").trim();
 };
 
+// Strips common business-entity suffixes/connectors so that names like
+// "Pacific Impex Ltd" and "Pacific Impex Wholesalers & Distributors" both
+// reduce to a comparable "core" string ("pacific impex"). This prevents the
+// same supplier appearing on different dockets from creating duplicate rep
+// profiles just because the printed company name varies slightly.
+const normalizeCompanyName = (name: string): string => {
+  return name
+    .toLowerCase()
+    .replace(/[&]/g, " and ")
+    .replace(/\b(ltd|limited|inc|incorporated|llc|pty|co|company)\b/g, "")
+    .replace(/\b(wholesalers?|distributors?|trading|imports?|exports?|nz|new zealand)\b/g, "")
+    .replace(/\b(and|of|the)\b/g, "")
+    .replace(/[^a-z0-9\s]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+};
+
 export default function DocketScanner({ reps, onScanConfirmed, currentUserUid }: DocketScannerProps) {
   const [dragActive, setDragActive] = useState(false);
   const [file, setFile] = useState<File | null>(null);
@@ -48,6 +65,8 @@ export default function DocketScanner({ reps, onScanConfirmed, currentUserUid }:
   const [extractedData, setExtractedData] = useState<{
     supplierName: string;
     repName: string | null;
+    repPhone: string | null;
+    repEmail: string | null;
     invoiceDate: string;
     totalAmount: number;
     items: InvoiceItem[];
@@ -97,20 +116,56 @@ export default function DocketScanner({ reps, onScanConfirmed, currentUserUid }:
       reader.onerror = reject;
     });
 
-  const findOrCreateRep = async (supplierName: string, repName: string | null): Promise<string> => {
-    const existingRep = reps.find(r =>
-      r.company.toLowerCase().includes(supplierName.toLowerCase()) ||
-      supplierName.toLowerCase().includes(r.company.toLowerCase())
-    );
-    if (existingRep) return existingRep.id;
+  // Finds an existing rep by NORMALIZED company-name match (handles legal
+  // suffix variations like "Ltd" vs "Wholesalers & Distributors" referring
+  // to the same supplier), or creates a new one if truly no match exists.
+  // Also accepts phone/email extracted from the docket:
+  // - If creating a new rep, phone/email are filled in immediately.
+  // - If the rep already exists but is missing phone/email, this patches
+  //   those fields in rather than leaving them blank forever.
+  const findOrCreateRep = async (
+    supplierName: string,
+    repName: string | null,
+    repPhone: string | null,
+    repEmail: string | null
+  ): Promise<string> => {
+    const normalizedTarget = normalizeCompanyName(supplierName);
+
+    const existingRep = reps.find(r => {
+      const normalizedExisting = normalizeCompanyName(r.company);
+      if (!normalizedExisting || !normalizedTarget) return false;
+      return (
+        normalizedExisting === normalizedTarget ||
+        normalizedExisting.includes(normalizedTarget) ||
+        normalizedTarget.includes(normalizedExisting)
+      );
+    });
+
+    if (existingRep) {
+      const patch: { phone?: string; email?: string } = {};
+      if (!existingRep.phone && repPhone) patch.phone = repPhone;
+      if (!existingRep.email && repEmail) patch.email = repEmail;
+      if (Object.keys(patch).length > 0) {
+        try {
+          await updateDoc(doc(db, "reps", existingRep.id), patch);
+        } catch (err) {
+          console.warn("Could not patch missing rep contact info:", err);
+        }
+      }
+      return existingRep.id;
+    }
 
     const repRef = doc(collection(db, "reps"));
-    await setDoc(repRef, {
+    const newRepPayload: any = {
       id: repRef.id,
       name: repName || supplierName,
       company: supplierName,
       createdAt: serverTimestamp()
-    });
+    };
+    if (repPhone) newRepPayload.phone = repPhone;
+    if (repEmail) newRepPayload.email = repEmail;
+
+    await setDoc(repRef, newRepPayload);
     return repRef.id;
   };
 
@@ -130,6 +185,8 @@ Extract and return ONLY a valid JSON object with no markdown, no explanation:
 {
   "supplierName": "full company name on the docket",
   "repName": "sales rep name if visible, otherwise null",
+  "repPhone": "sales rep or supplier contact phone number if visible anywhere on the docket (e.g. near a contact name, 'Ph:', 'Mob:', 'Tel:'), otherwise null",
+  "repEmail": "sales rep or supplier contact email address if visible anywhere on the docket, otherwise null",
   "invoiceDate": "date in YYYY-MM-DD format, or null",
   "totalAmount": total invoice amount as number or 0,
   "items": [
@@ -151,6 +208,8 @@ Critical rules:
 - Keep product size like 375ML, 500ML, 130G in name
 - price = UNIT PRICE column value
 - quantity = QTY column value as integer
+- repPhone and repEmail can belong to a named contact person on the docket even if that person is not explicitly labelled "rep" — use your judgement based on context (e.g. a name with a phone number and/or email near the supplier letterhead)
+- If multiple contact names with phone numbers are listed (e.g. several reps for the same company), pick the one that most likely corresponds to repName, or the first one listed if repName is null
 - Return only JSON, nothing else`;
 
       const ocrRaw = await callGemini(ocrPrompt, { mime_type: mimeType, data: base64 });
@@ -271,13 +330,17 @@ Return ONLY a JSON array, no markdown:
       // ── STEP 4: Find or create rep ─────────────────────────────────────
       const repId = await findOrCreateRep(
         ocrPayload.supplierName || "Unknown Supplier",
-        ocrPayload.repName
+        ocrPayload.repName,
+        ocrPayload.repPhone || null,
+        ocrPayload.repEmail || null
       );
       setSelectedRepId(repId);
 
       setExtractedData({
         supplierName: ocrPayload.supplierName || "Unknown Supplier",
         repName: ocrPayload.repName || null,
+        repPhone: ocrPayload.repPhone || null,
+        repEmail: ocrPayload.repEmail || null,
         invoiceDate: ocrPayload.invoiceDate || new Date().toISOString().split("T")[0],
         totalAmount: ocrPayload.totalAmount || 0,
         items: matchedItems
@@ -504,6 +567,16 @@ Return ONLY a JSON array, no markdown:
               </div>
             </div>
           </div>
+
+          {/* Show extracted rep contact info, if any, so it's visible before confirming */}
+          {(extractedData.repPhone || extractedData.repEmail) && (
+            <div className="flex items-center gap-3 p-2 bg-emerald-50/50 border border-emerald-100 rounded text-[10px] text-emerald-800">
+              <span className="font-bold uppercase text-[8px] tracking-wider">Contact found on docket:</span>
+              {extractedData.repPhone && <span>📞 {extractedData.repPhone}</span>}
+              {extractedData.repEmail && <span>✉️ {extractedData.repEmail}</span>}
+              <span className="text-[8px] text-emerald-600 ml-auto">Saved to rep profile automatically</span>
+            </div>
+          )}
 
           <div className="space-y-1.5">
             <div className="flex items-center justify-between">

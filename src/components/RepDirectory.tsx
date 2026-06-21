@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useEffect } from "react";
 import { Users as UsersIcon, Phone as PhoneIcon, Mail as MailIcon, Calendar as CalendarIcon, PlusCircle as PlusIcon, CheckCircle as CheckIcon, Calculator as CalcIcon, AlertTriangle as AlertIcon, FileSpreadsheet as SheetIcon, Copy as CopyIcon, Printer as PrinterIcon, Loader2 as LoaderIcon, AlertCircle as AlertCircleIcon, Edit2, Trash2, Save, X, Search, TrendingUp, TrendingDown, Minus, FileText, Package } from "lucide-react";
-import { collection, doc, setDoc, getDocs, updateDoc, deleteDoc, serverTimestamp } from "firebase/firestore";
+import { collection, doc, setDoc, getDocs, updateDoc, deleteDoc, serverTimestamp, query, where, writeBatch } from "firebase/firestore";
 import { db, handleFirestoreError, OperationType } from "../firebase";
 import { Rep, Visit, Product, PriceEntry, Invoice } from "../types";
 import { motion } from "motion/react";
@@ -13,15 +13,59 @@ interface RepDirectoryProps {
   invoices: Invoice[];
   onRepChange: () => void;
   currentUserUid: string;
+  selectedRepId: string;
+  setSelectedRepId: (value: string) => void;
+  activeTab: "products" | "visits" | "notepad" | "order";
+  setActiveTab: (value: "products" | "visits" | "notepad" | "order") => void;
+  repProductSearch: string;
+  setRepProductSearch: (value: string) => void;
+  expandedProductId: string | null;
+  setExpandedProductId: (value: string | null) => void;
 }
 
-export default function RepDirectory({ reps, visits, products, priceEntries, invoices, onRepChange, currentUserUid }: RepDirectoryProps) {
-  const [selectedRepId, setSelectedRepId] = useState<string>("");
+// Shape of the in-progress edit form for a single price entry. All four
+// fields are independently editable — none of them auto-overwrite each
+// other on save. Per Unit / Per Unit (+GST) are NOT part of this form
+// since they're purely computed display values, derived live from
+// boxPrice and packQuantity.
+interface PriceEditForm {
+  priceEntryId: string;
+  productName: string;
+  unitPrice: string;
+  discPercent: string;
+  boxPrice: string;
+  packQuantity: string;
+}
+
+export default function RepDirectory({
+  reps,
+  visits,
+  products,
+  priceEntries,
+  invoices,
+  onRepChange,
+  currentUserUid,
+  selectedRepId,
+  setSelectedRepId,
+  activeTab,
+  setActiveTab,
+  repProductSearch,
+  setRepProductSearch,
+  expandedProductId,
+  setExpandedProductId
+}: RepDirectoryProps) {
   const [showAddForm, setShowAddForm] = useState(false);
   const [copiedOrder, setCopiedOrder] = useState(false);
   const [showPrintReport, setShowPrintReport] = useState(false);
-  const [activeTab, setActiveTab] = useState<"products" | "visits" | "notepad" | "order">("products");
-  const [expandedProductId, setExpandedProductId] = useState<string | null>(null);
+  // Delete-price-entry state: tracks which product row has its delete
+  // confirmation open, and whether a delete is currently in flight.
+  const [confirmDeletePriceId, setConfirmDeletePriceId] = useState<string | null>(null);
+  const [isDeletingPrice, setIsDeletingPrice] = useState(false);
+  // Edit-price-entry state: holds the in-progress edit form when a row's
+  // edit modal is open, plus saving/error state for that save action.
+  const [editingPrice, setEditingPrice] = useState<PriceEditForm | null>(null);
+  const [isSavingPriceEdit, setIsSavingPriceEdit] = useState(false);
+  const [priceEditError, setPriceEditError] = useState<string | null>(null);
   // Add rep state
   const [newName, setNewName] = useState("");
   const [newCompany, setNewCompany] = useState("");
@@ -54,9 +98,6 @@ export default function RepDirectory({ reps, visits, products, priceEntries, inv
   const [notepadSaving, setNotepadSaving] = useState(false);
   const [notepadSaved, setNotepadSaved] = useState(false);
   const [notepadLoaded, setNotepadLoaded] = useState(false);
-
-  // Product search within rep
-  const [repProductSearch, setRepProductSearch] = useState("");
 
   // Order state
   const [orderQtys, setOrderQtys] = useState<{ [prodId: string]: number }>({});
@@ -127,9 +168,12 @@ export default function RepDirectory({ reps, visits, products, priceEntries, inv
 
   // Get current and previous prices per product for this rep.
   // packQuantity, unitPrice, and discPercent are passed through exactly as
-  // extracted/computed in DocketScanner.tsx — no calculation happens here.
+  // extracted/computed in DocketScanner.tsx, OR as subsequently corrected
+  // via the edit modal — no calculation happens in this memo itself.
+  // Also exposes the latest entry's own document id (latestEntryId) so the
+  // per-row edit/delete buttons know exactly which Firestore doc to touch.
   const productPriceData = useMemo(() => {
-    const data: { [productId: string]: { current: number; previous: number | null; change: number | null; changePct: number | null; packQuantity: number | null; unitPrice: number | null; discPercent: number | null; effectiveDate: any } } = {};
+    const data: { [productId: string]: { current: number; previous: number | null; change: number | null; changePct: number | null; packQuantity: number | null; unitPrice: number | null; discPercent: number | null; effectiveDate: any; latestEntryId: string } } = {};
 
     repSuppliedProductIds.forEach(productId => {
       const entries = priceEntries
@@ -150,8 +194,9 @@ export default function RepDirectory({ reps, visits, products, priceEntries, inv
       const unitPrice = (entries[0] as any).unitPrice ?? null;
       const discPercent = (entries[0] as any).discPercent ?? null;
       const effectiveDate = entries[0].effectiveDate;
+      const latestEntryId = entries[0].id;
 
-      data[productId] = { current, previous, change, changePct, packQuantity, unitPrice, discPercent, effectiveDate };
+      data[productId] = { current, previous, change, changePct, packQuantity, unitPrice, discPercent, effectiveDate, latestEntryId };
     });
 
     return data;
@@ -245,10 +290,29 @@ export default function RepDirectory({ reps, visits, products, priceEntries, inv
     }
   };
 
+  // Deletes a rep AND all of their associated price history. Previously this
+  // only deleted the rep document, leaving every priceEntry pointing at a
+  // now-nonexistent repId — these orphans showed up as "Unknown Rep" in
+  // ProductCatalog and made testing/re-scanning impossible to clean up
+  // without a manual Firestore script. This now cascades properly.
   const handleDeleteRep = async () => {
     if (!selectedRepId) return;
     setIsDeleting(true);
     try {
+      const pricesQuery = query(collection(db, "prices"), where("repId", "==", selectedRepId));
+      const pricesSnap = await getDocs(pricesQuery);
+
+      if (!pricesSnap.empty) {
+        const BATCH_SIZE = 500;
+        const docs = pricesSnap.docs;
+        for (let i = 0; i < docs.length; i += BATCH_SIZE) {
+          const batch = writeBatch(db);
+          const chunk = docs.slice(i, i + BATCH_SIZE);
+          chunk.forEach(d => batch.delete(doc(db, "prices", d.id)));
+          await batch.commit();
+        }
+      }
+
       await deleteDoc(doc(db, "reps", selectedRepId));
       setSelectedRepId("");
       setShowDeleteConfirm(false);
@@ -257,6 +321,89 @@ export default function RepDirectory({ reps, visits, products, priceEntries, inv
       handleFirestoreError(err, OperationType.DELETE, `reps/${selectedRepId}`);
     } finally {
       setIsDeleting(false);
+    }
+  };
+
+  // Deletes a single price history entry (the latest one shown for a
+  // product under this rep) without touching the rep profile or any other
+  // price entries. Used to remove a single bad/duplicate scan.
+  const handleDeletePriceEntry = async (priceEntryId: string) => {
+    setIsDeletingPrice(true);
+    try {
+      await deleteDoc(doc(db, "prices", priceEntryId));
+      setConfirmDeletePriceId(null);
+      onRepChange();
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, `prices/${priceEntryId}`);
+    } finally {
+      setIsDeletingPrice(false);
+    }
+  };
+
+  // Opens the edit modal for a given product's latest price entry,
+  // pre-filling the form with its current values.
+  const handleOpenPriceEdit = (productName: string, pd: { latestEntryId: string; unitPrice: number | null; discPercent: number | null; current: number; packQuantity: number | null }) => {
+    setPriceEditError(null);
+    setEditingPrice({
+      priceEntryId: pd.latestEntryId,
+      productName,
+      unitPrice: pd.unitPrice != null ? pd.unitPrice.toString() : "",
+      discPercent: pd.discPercent != null ? pd.discPercent.toString() : "0",
+      boxPrice: pd.current.toString(),
+      packQuantity: pd.packQuantity != null ? pd.packQuantity.toString() : "1"
+    });
+  };
+
+  // Saves all four edited fields directly to Firestore. Each field is
+  // independent — editing one does NOT recompute or overwrite another.
+  // Per Unit / Per Unit (+GST) are not stored; they're always derived live
+  // from boxPrice/packQuantity wherever they're displayed.
+  const handleSavePriceEdit = async () => {
+    if (!editingPrice) return;
+
+    const parsedUnitPrice = parseFloat(editingPrice.unitPrice);
+    const parsedDiscPercent = parseFloat(editingPrice.discPercent);
+    const parsedBoxPrice = parseFloat(editingPrice.boxPrice);
+    const parsedPackQuantity = parseInt(editingPrice.packQuantity);
+
+    if (isNaN(parsedBoxPrice) || parsedBoxPrice < 0) {
+      setPriceEditError("Box Price must be a valid non-negative number.");
+      return;
+    }
+    if (isNaN(parsedPackQuantity) || parsedPackQuantity < 1) {
+      setPriceEditError("Units/Box must be a whole number of at least 1.");
+      return;
+    }
+    if (editingPrice.unitPrice.trim() && (isNaN(parsedUnitPrice) || parsedUnitPrice < 0)) {
+      setPriceEditError("Unit Price must be a valid non-negative number, or left blank.");
+      return;
+    }
+    if (editingPrice.discPercent.trim() && (isNaN(parsedDiscPercent) || parsedDiscPercent < 0 || parsedDiscPercent > 100)) {
+      setPriceEditError("Disc% must be between 0 and 100.");
+      return;
+    }
+
+    setIsSavingPriceEdit(true);
+    setPriceEditError(null);
+    try {
+      const updatePayload: any = {
+        price: parsedBoxPrice,
+        packQuantity: parsedPackQuantity
+      };
+      // Only write unitPrice/discPercent if something was actually entered —
+      // keeps them null/absent for entries that never had this data rather
+      // than forcing a 0 onto old manual entries that predate these fields.
+      if (editingPrice.unitPrice.trim()) updatePayload.unitPrice = parsedUnitPrice;
+      if (editingPrice.discPercent.trim()) updatePayload.discPercent = parsedDiscPercent;
+
+      await updateDoc(doc(db, "prices", editingPrice.priceEntryId), updatePayload);
+      setEditingPrice(null);
+      onRepChange();
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `prices/${editingPrice.priceEntryId}`);
+      setPriceEditError("Failed to save changes. Please try again.");
+    } finally {
+      setIsSavingPriceEdit(false);
     }
   };
 
@@ -370,6 +517,18 @@ export default function RepDirectory({ reps, visits, products, priceEntries, inv
       </span>
     );
   };
+
+  // Live preview of Per Unit / Per Unit (+GST) inside the edit modal, based
+  // on whatever the form currently holds — purely for the manager's
+  // reference while editing, not saved anywhere.
+  const editPreview = useMemo(() => {
+    if (!editingPrice) return null;
+    const box = parseFloat(editingPrice.boxPrice);
+    const pack = parseInt(editingPrice.packQuantity);
+    if (isNaN(box) || isNaN(pack) || pack <= 0) return null;
+    const perUnit = box / pack;
+    return { perUnit, perUnitGst: perUnit * 1.15 };
+  }, [editingPrice]);
 
   return (
     <>
@@ -498,13 +657,13 @@ export default function RepDirectory({ reps, visits, products, priceEntries, inv
                   ) : showDeleteConfirm ? (
                     <div className="p-3 bg-rose-50 border border-rose-200 rounded space-y-2">
                       <p className="text-[11px] font-bold text-rose-800">Delete {selectedRep.name}?</p>
-                      <p className="text-[10px] text-rose-700">This will delete the rep profile. Price history and invoices will remain. This cannot be undone.</p>
+                      <p className="text-[10px] text-rose-700">This will permanently delete the rep profile <strong>and all price history</strong> associated with them. Invoices will remain but show no linked rep. This cannot be undone.</p>
                       <div className="flex gap-2">
                         <button onClick={handleDeleteRep} disabled={isDeleting} className="px-2 py-1 bg-rose-600 hover:bg-rose-700 text-white text-[10px] font-bold rounded cursor-pointer flex items-center gap-1">
                           {isDeleting ? <LoaderIcon className="h-3 w-3 animate-spin" /> : <Trash2 className="h-3 w-3" />}
-                          <span>Yes, Delete</span>
+                          <span>{isDeleting ? "Deleting price history..." : "Yes, Delete"}</span>
                         </button>
-                        <button onClick={() => setShowDeleteConfirm(false)} className="px-2 py-1 border border-slate-200 hover:bg-slate-50 text-slate-600 text-[10px] rounded cursor-pointer">Cancel</button>
+                        <button onClick={() => setShowDeleteConfirm(false)} disabled={isDeleting} className="px-2 py-1 border border-slate-200 hover:bg-slate-50 text-slate-600 text-[10px] rounded cursor-pointer">Cancel</button>
                       </div>
                     </div>
                   ) : (
@@ -588,6 +747,10 @@ export default function RepDirectory({ reps, visits, products, priceEntries, inv
                       {repSuppliedProductIds.length === 0 ? "No products yet — scan a docket from this rep first." : "No products match your search."}
                     </div>
                   ) : (
+                    <>
+                    <p className="text-[9px] text-slate-400 pl-1">
+                      "Box Price" and "Per Unit" are wholesale, <strong>excluding GST</strong>. "Per Unit (+GST)" includes the 15% GST applied on top — use that figure when setting retail prices. Made a mistake? Click the pencil icon to fix any field.
+                    </p>
                     <div className="overflow-x-auto border border-slate-200 rounded max-h-80 overflow-y-auto">
                       <table className="w-full text-left text-[10px]">
                         <thead className="bg-slate-50 sticky top-0 z-10">
@@ -596,9 +759,12 @@ export default function RepDirectory({ reps, visits, products, priceEntries, inv
                             <th className="p-1.5 px-2 text-right">Box Price</th>
                             <th className="p-1.5 px-2 text-center">Units/Box</th>
                             <th className="p-1.5 px-2 text-right">Per Unit</th>
+                            <th className="p-1.5 px-2 text-right">Per Unit (+GST)</th>
                             <th className="p-1.5 px-2 text-right">Previous</th>
                             <th className="p-1.5 px-2 text-center">Change</th>
                             <th className="p-1.5 px-2 text-center">Status</th>
+                            <th className="p-1.5 px-2 text-center">Edit</th>
+                            <th className="p-1.5 px-2 text-center">Remove</th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-100">
@@ -607,6 +773,7 @@ export default function RepDirectory({ reps, visits, products, priceEntries, inv
                             const isExpanded = expandedProductId === p.id;
                             const hasAuditTrail = pd?.unitPrice != null;
                             const isFreePromo = (pd?.discPercent ?? 0) >= 100;
+                            const isConfirmingDelete = pd?.latestEntryId && confirmDeletePriceId === pd.latestEntryId;
                             return (
                               <React.Fragment key={p.id}>
                                 <tr className="hover:bg-slate-50/50">
@@ -636,6 +803,11 @@ export default function RepDirectory({ reps, visits, products, priceEntries, inv
                                       ? `$${(pd.current / pd.packQuantity).toFixed(2)}`
                                       : "—"}
                                   </td>
+                                  <td className="p-1.5 px-2 text-right font-bold font-mono text-slate-700">
+                                    {pd?.current && pd?.packQuantity
+                                      ? `$${((pd.current / pd.packQuantity) * 1.15).toFixed(2)}`
+                                      : "—"}
+                                  </td>
                                   <td className="p-1.5 px-2 text-right font-mono text-slate-400">
                                     {pd?.previous ? `$${pd.previous.toFixed(2)}` : "—"}
                                   </td>
@@ -652,12 +824,55 @@ export default function RepDirectory({ reps, visits, products, priceEntries, inv
                                       </span>
                                     )}
                                   </td>
+                                  <td className="p-1.5 px-2 text-center">
+                                    {pd?.latestEntryId && (
+                                      <button
+                                        onClick={() => handleOpenPriceEdit(p.name, pd)}
+                                        title="Edit this price entry"
+                                        className="text-slate-400 hover:text-emerald-600 cursor-pointer"
+                                      >
+                                        <Edit2 className="h-3 w-3" />
+                                      </button>
+                                    )}
+                                  </td>
+                                  <td className="p-1.5 px-2 text-center">
+                                    {pd?.latestEntryId && (
+                                      <button
+                                        onClick={() => setConfirmDeletePriceId(isConfirmingDelete ? null : pd.latestEntryId)}
+                                        title="Remove this price entry"
+                                        className="text-slate-400 hover:text-rose-600 cursor-pointer"
+                                      >
+                                        <Trash2 className="h-3 w-3" />
+                                      </button>
+                                    )}
+                                  </td>
                                 </tr>
+                                {isConfirmingDelete && (
+                                  <tr className="bg-rose-50">
+                                    <td colSpan={10} className="p-1.5 px-2 text-[9px] text-rose-800">
+                                      <span className="font-bold">Remove this price entry for "{p.name}"?</span> This only deletes this one entry — the rep profile and other products are not affected.
+                                      <button
+                                        onClick={() => handleDeletePriceEntry(pd.latestEntryId)}
+                                        disabled={isDeletingPrice}
+                                        className="ml-2 px-1.5 py-0.5 bg-rose-600 hover:bg-rose-700 text-white text-[9px] font-bold rounded cursor-pointer disabled:opacity-50"
+                                      >
+                                        {isDeletingPrice ? "Removing..." : "Yes, remove"}
+                                      </button>
+                                      <button
+                                        onClick={() => setConfirmDeletePriceId(null)}
+                                        disabled={isDeletingPrice}
+                                        className="ml-1.5 px-1.5 py-0.5 border border-slate-300 hover:bg-slate-100 text-slate-600 text-[9px] rounded cursor-pointer"
+                                      >
+                                        Cancel
+                                      </button>
+                                    </td>
+                                  </tr>
+                                )}
                                 {isExpanded && hasAuditTrail && (
                                   <tr className={isFreePromo ? "bg-amber-50" : "bg-emerald-50/40"}>
-                                    <td colSpan={7} className={`p-1.5 px-2 text-[9px] ${isFreePromo ? "text-amber-800" : "text-emerald-800"}`}>
+                                    <td colSpan={10} className={`p-1.5 px-2 text-[9px] ${isFreePromo ? "text-amber-800" : "text-emerald-800"}`}>
                                       <span className="font-bold">From docket:</span>{" "}
-                                      ${pd!.unitPrice!.toFixed(2)} unit price × (1 − {pd!.discPercent ?? 0}% disc) = ${pd!.current?.toFixed(2)} box price
+                                      ${pd!.unitPrice!.toFixed(2)} unit price × (1 − {pd!.discPercent ?? 0}% disc) = ${pd!.current?.toFixed(2)} box price (excl. GST)
                                       {isFreePromo && (
                                         <span className="ml-1.5 font-bold">— 100% discount, likely free/promo. Do not use for retail pricing.</span>
                                       )}
@@ -675,6 +890,7 @@ export default function RepDirectory({ reps, visits, products, priceEntries, inv
                         </tbody>
                       </table>
                     </div>
+                    </>
                   )}
                 </div>
               )}
@@ -822,6 +1038,104 @@ export default function RepDirectory({ reps, visits, products, priceEntries, inv
           )}
         </div>
       </div>
+
+      {/* PRICE EDIT MODAL */}
+      {editingPrice && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 p-4">
+          <div className="bg-white rounded-lg shadow-2xl border border-slate-200 w-full max-w-md p-5 relative">
+            <div className="flex items-center justify-between border-b border-slate-200 pb-2.5 mb-3">
+              <div>
+                <h2 className="text-xs font-extrabold text-slate-800">Edit Price Entry</h2>
+                <p className="text-[10px] text-slate-500 mt-0.5 line-clamp-1">{editingPrice.productName}</p>
+              </div>
+              <button
+                onClick={() => setEditingPrice(null)}
+                className="p-1 text-slate-400 hover:text-slate-700 cursor-pointer"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            {priceEditError && (
+              <div className="p-2 bg-rose-50 text-rose-800 border border-rose-200 rounded text-[10px] flex items-center gap-1.5 mb-3">
+                <AlertCircleIcon className="h-3.5 w-3.5 shrink-0 text-rose-600" />
+                <span>{priceEditError}</span>
+              </div>
+            )}
+
+            <div className="space-y-3">
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-0.5">
+                  <label className="text-[9px] uppercase font-bold text-slate-400">Unit Price ($)</label>
+                  <input
+                    type="number" step="0.01"
+                    className="w-full text-[11px] p-1.5 bg-white border border-slate-200 rounded focus:outline-none focus:border-emerald-500 font-mono"
+                    placeholder="Pre-discount box price"
+                    value={editingPrice.unitPrice}
+                    onChange={(e) => setEditingPrice({ ...editingPrice, unitPrice: e.target.value })}
+                  />
+                </div>
+                <div className="space-y-0.5">
+                  <label className="text-[9px] uppercase font-bold text-slate-400">Disc %</label>
+                  <input
+                    type="number" step="0.01" min="0" max="100"
+                    className="w-full text-[11px] p-1.5 bg-white border border-slate-200 rounded focus:outline-none focus:border-emerald-500 font-mono"
+                    placeholder="0"
+                    value={editingPrice.discPercent}
+                    onChange={(e) => setEditingPrice({ ...editingPrice, discPercent: e.target.value })}
+                  />
+                </div>
+                <div className="space-y-0.5">
+                  <label className="text-[9px] uppercase font-bold text-slate-400">Box Price ($) *</label>
+                  <input
+                    type="number" step="0.01" required
+                    className="w-full text-[11px] p-1.5 bg-white border border-slate-200 rounded focus:outline-none focus:border-emerald-500 font-mono font-bold"
+                    value={editingPrice.boxPrice}
+                    onChange={(e) => setEditingPrice({ ...editingPrice, boxPrice: e.target.value })}
+                  />
+                </div>
+                <div className="space-y-0.5">
+                  <label className="text-[9px] uppercase font-bold text-slate-400">Units/Box *</label>
+                  <input
+                    type="number" min="1" required
+                    className="w-full text-[11px] p-1.5 bg-white border border-slate-200 rounded focus:outline-none focus:border-emerald-500 font-mono font-bold"
+                    value={editingPrice.packQuantity}
+                    onChange={(e) => setEditingPrice({ ...editingPrice, packQuantity: e.target.value })}
+                  />
+                </div>
+              </div>
+
+              <p className="text-[8px] text-slate-400">
+                Each field is saved exactly as entered — editing one does not recalculate another. Unit Price / Disc% are kept for reference; Box Price and Units/Box are what's actually used everywhere else.
+              </p>
+
+              {editPreview && (
+                <div className="p-2 bg-emerald-50/60 border border-emerald-200 rounded text-[10px] text-emerald-800">
+                  <span className="font-bold">Live preview (not saved):</span> Per Unit ${editPreview.perUnit.toFixed(2)} · Per Unit (+GST) ${editPreview.perUnitGst.toFixed(2)}
+                </div>
+              )}
+            </div>
+
+            <div className="flex justify-end gap-2 pt-4 mt-2 border-t border-slate-200">
+              <button
+                onClick={() => setEditingPrice(null)}
+                disabled={isSavingPriceEdit}
+                className="px-3 py-1.5 border border-slate-200 hover:bg-slate-50 text-slate-600 text-[11px] font-semibold rounded cursor-pointer disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleSavePriceEdit}
+                disabled={isSavingPriceEdit}
+                className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white text-[11px] font-bold rounded cursor-pointer flex items-center gap-1.5 disabled:opacity-50"
+              >
+                {isSavingPriceEdit ? <LoaderIcon className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
+                <span>{isSavingPriceEdit ? "Saving..." : "Save Changes"}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* PRINT REPORT MODAL */}
       {showPrintReport && selectedRep && (

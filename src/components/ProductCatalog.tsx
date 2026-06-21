@@ -1,21 +1,38 @@
-import React, { useState, useMemo, useEffect } from "react";
+import React, { useEffect } from "react";
 import { Search, Star, AlertTriangle, History, Landmark, PlusCircle, Bookmark, CheckCircle, Package } from "lucide-react";
 import { collection, doc, setDoc, updateDoc, serverTimestamp, query, where, getDocs, limit } from "firebase/firestore";
 import { db, handleFirestoreError, OperationType } from "../firebase";
 import { Product, Rep, PriceEntry } from "../types";
 import { motion } from "motion/react";
+import { useState, useMemo } from "react";
 
 interface ProductCatalogProps {
   reps: Rep[];
   priceEntries: PriceEntry[];
   currentUserUid: string;
+  // Lifted up to App.tsx so this state survives tab switches — this
+  // component used to keep these as local useState, but App.tsx unmounts
+  // this component when switching tabs, which wiped the search every time.
+  searchQuery: string;
+  setSearchQuery: (value: string) => void;
+  searchResults: Product[];
+  setSearchResults: (value: Product[]) => void;
+  selectedProductId: string;
+  setSelectedProductId: (value: string) => void;
 }
 
-export default function ProductCatalog({ reps, priceEntries, currentUserUid }: ProductCatalogProps) {
-  const [searchQuery, setSearchQuery] = useState("");
-  const [searchResults, setSearchResults] = useState<Product[]>([]);
+export default function ProductCatalog({
+  reps,
+  priceEntries,
+  currentUserUid,
+  searchQuery,
+  setSearchQuery,
+  searchResults,
+  setSearchResults,
+  selectedProductId,
+  setSelectedProductId
+}: ProductCatalogProps) {
   const [isSearching, setIsSearching] = useState(false);
-  const [selectedProductId, setSelectedProductId] = useState<string>("");
   const [manualRepId, setManualRepId] = useState("");
   const [manualPrice, setManualPrice] = useState("");
   const [manualPack, setManualPack] = useState("Single Unit");
@@ -92,12 +109,21 @@ export default function ProductCatalog({ reps, priceEntries, currentUserUid }: P
     return cheapest.repId;
   }, [repCurrentPrices]);
 
+  // Helper: returns the per-unit price (excl. GST) for a price entry, using
+  // packQuantity if present (new structured data), or falling back to null
+  // for old entries that only have the legacy packSize string.
+  const getPerUnit = (entry: PriceEntry): number | null => {
+    const packQty = (entry as any).packQuantity;
+    if (packQty && packQty > 0) return entry.price / packQty;
+    return null;
+  };
+
   const handleToggleLowStock = async () => {
     if (!selectedProduct) return;
     const docRef = doc(db, "products", selectedProduct.id);
     try {
       await updateDoc(docRef, { lowStock: !selectedProduct.lowStock, updatedAt: serverTimestamp() });
-      setSearchResults(prev => prev.map(p => p.id === selectedProduct.id ? { ...p, lowStock: !p.lowStock } : p));
+      setSearchResults(searchResults.map(p => p.id === selectedProduct.id ? { ...p, lowStock: !p.lowStock } : p));
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `products/${selectedProduct.id}`);
     }
@@ -126,7 +152,7 @@ export default function ProductCatalog({ reps, priceEntries, currentUserUid }: P
         lowStock: isLowStock,
         updatedAt: serverTimestamp()
       });
-      setSearchResults(prev => prev.map(p =>
+      setSearchResults(searchResults.map(p =>
         p.id === selectedProduct.id ? { ...p, currentStock: curStock, minStockLevel: minStock, lowStock: isLowStock } : p
       ));
       setStockSuccess(true);
@@ -141,7 +167,7 @@ export default function ProductCatalog({ reps, priceEntries, currentUserUid }: P
     const docRef = doc(db, "products", selectedProduct.id);
     try {
       await updateDoc(docRef, { preferredRepId: repId || null, updatedAt: serverTimestamp() });
-      setSearchResults(prev => prev.map(p =>
+      setSearchResults(searchResults.map(p =>
         p.id === selectedProduct.id ? { ...p, preferredRepId: repId || null } : p
       ));
     } catch (err) {
@@ -351,6 +377,8 @@ export default function ProductCatalog({ reps, priceEntries, currentUserUid }: P
                     const matchedRep = reps.find(r => r.id === entry.repId);
                     const isCheapest = entry.repId === lowestPriceRepId;
                     const isPreferred = entry.repId === selectedProduct.preferredRepId;
+                    const packQty = (entry as any).packQuantity;
+                    const perUnit = getPerUnit(entry);
                     return (
                       <div
                         key={entry.id}
@@ -375,8 +403,18 @@ export default function ProductCatalog({ reps, priceEntries, currentUserUid }: P
                           </h4>
                           <div className="flex items-baseline gap-0.5 mt-1.5">
                             <span className="text-[15px] font-extrabold text-slate-900">${entry.price.toFixed(2)}</span>
-                            <span className="text-[9px] text-slate-400">/{entry.packSize || "unit"}</span>
+                            <span className="text-[9px] text-slate-400">
+                              /{packQty ? `${packQty}-box` : (entry.packSize || "unit")}
+                            </span>
                           </div>
+                          {perUnit !== null ? (
+                            <div className="flex items-center gap-2 mt-1 text-[9px]">
+                              <span className="font-bold text-emerald-700">${perUnit.toFixed(2)}/unit</span>
+                              <span className="text-slate-400">${(perUnit * 1.15).toFixed(2)}/unit +GST</span>
+                            </div>
+                          ) : entry.packSize ? (
+                            <p className="text-[8px] text-slate-400 mt-1">{entry.packSize}</p>
+                          ) : null}
                         </div>
                         <div className="mt-2 pt-1 border-t border-slate-100 text-[8px] text-slate-400">
                           Updated: {new Date(entry.effectiveDate?.seconds ? entry.effectiveDate.seconds * 1000 : entry.effectiveDate).toLocaleDateString()}
@@ -399,17 +437,26 @@ export default function ProductCatalog({ reps, priceEntries, currentUserUid }: P
                 <div className="space-y-1 max-h-36 overflow-y-auto pr-1">
                   {productPriceHistory.map(entry => {
                     const r = reps.find(rep => rep.id === entry.repId);
+                    const packQty = (entry as any).packQuantity;
+                    const perUnit = getPerUnit(entry);
                     return (
                       <div key={entry.id} className="flex items-center justify-between p-1.5 bg-slate-50 border border-slate-150 rounded text-[10px]">
                         <div className="space-y-0.5">
-                          <p className="font-bold text-slate-700">{r ? `${r.name} (${r.company})` : "Manual Entry"}</p>
+                          <p className="font-bold text-slate-700">{r ? `${r.name} (${r.company})` : "Manual Entry / Unlinked Rep"}</p>
                           <p className="text-[8px] text-slate-400">
                             {new Date(entry.createdAt?.seconds ? entry.createdAt.seconds * 1000 : entry.createdAt).toLocaleDateString()}
                           </p>
                         </div>
                         <div className="text-right">
                           <p className="font-extrabold text-emerald-800">${entry.price.toFixed(2)}</p>
-                          <p className="text-[8px] text-slate-400 font-mono">{entry.packSize || "Single Unit"}</p>
+                          <p className="text-[8px] text-slate-400 font-mono">
+                            {packQty ? `${packQty}/box` : (entry.packSize || "Single Unit")}
+                          </p>
+                          {perUnit !== null && (
+                            <p className="text-[8px] text-amber-700 font-mono">
+                              ${perUnit.toFixed(2)}/unit · ${(perUnit * 1.15).toFixed(2)} +GST
+                            </p>
+                          )}
                         </div>
                       </div>
                     );

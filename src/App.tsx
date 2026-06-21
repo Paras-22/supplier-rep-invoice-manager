@@ -35,6 +35,26 @@ export default function App() {
   // lazy-loaded via on-demand search in ProductCatalog.tsx for performance.
   const [products, setProducts] = useState<Product[]>([]);
 
+  // ProductCatalog's search state lifted up here so it survives tab
+  // switches. ProductCatalog used to keep this as local useState, but since
+  // App.tsx conditionally unmounts each tab's component, switching away and
+  // back created a fresh ProductCatalog instance with blank search state
+  // every time. Keeping it here (in a component that never unmounts) fixes
+  // that — ProductCatalog now reads/writes through these props instead.
+  const [catalogSearchQuery, setCatalogSearchQuery] = useState("");
+  const [catalogSearchResults, setCatalogSearchResults] = useState<Product[]>([]);
+  const [catalogSelectedProductId, setCatalogSelectedProductId] = useState("");
+
+  // RepDirectory's selection/sub-tab/search state lifted up here for the
+  // same reason — switching away from the Reps tab and back was wiping
+  // which rep was selected, which sub-tab (Products/Visits/Notepad/Order)
+  // was open, the in-rep product search text, and which product's audit
+  // trail was expanded.
+  const [repsSelectedRepId, setRepsSelectedRepId] = useState("");
+  const [repsActiveSubTab, setRepsActiveSubTab] = useState<"products" | "visits" | "notepad" | "order">("products");
+  const [repsProductSearch, setRepsProductSearch] = useState("");
+  const [repsExpandedProductId, setRepsExpandedProductId] = useState<string | null>(null);
+
   useEffect(() => {
     testConnection();
   }, []);
@@ -148,7 +168,7 @@ export default function App() {
     fetchAllVisits();
   }, [currentUser, reps, priceEntries]);
 
-  // NEW: Fetch only the product docs referenced by priceEntries.
+  // Fetch only the product docs referenced by priceEntries.
   // Without this, RepDirectory and POSImport never see any real product
   // data (they were previously hardcoded to receive an empty array),
   // even though the products exist in Firestore.
@@ -308,6 +328,13 @@ export default function App() {
     setInvoices([]);
     setLowStockProducts([]);
     setProducts([]);
+    setCatalogSearchQuery("");
+    setCatalogSearchResults([]);
+    setCatalogSelectedProductId("");
+    setRepsSelectedRepId("");
+    setRepsActiveSubTab("products");
+    setRepsProductSearch("");
+    setRepsExpandedProductId(null);
   };
 
   if (authLoading) {
@@ -460,8 +487,38 @@ export default function App() {
             transition={{ duration: 0.1 }}
           >
             {activeTab === "scan" && <DocketScanner reps={reps} products={products as any} onScanConfirmed={() => setActiveTab("catalog")} currentUserUid={currentUser.uid} />}
-            {activeTab === "catalog" && <ProductCatalog reps={reps} priceEntries={priceEntries} currentUserUid={currentUser.uid} />}
-            {activeTab === "reps" && <RepDirectory reps={reps} visits={allVisits} products={products} priceEntries={priceEntries} invoices={invoices} onRepChange={() => {}} currentUserUid={currentUser.uid} />}
+            {activeTab === "catalog" && (
+              <ProductCatalog
+                reps={reps}
+                priceEntries={priceEntries}
+                currentUserUid={currentUser.uid}
+                searchQuery={catalogSearchQuery}
+                setSearchQuery={setCatalogSearchQuery}
+                searchResults={catalogSearchResults}
+                setSearchResults={setCatalogSearchResults}
+                selectedProductId={catalogSelectedProductId}
+                setSelectedProductId={setCatalogSelectedProductId}
+              />
+            )}
+            {activeTab === "reps" && (
+              <RepDirectory
+                reps={reps}
+                visits={allVisits}
+                products={products}
+                priceEntries={priceEntries}
+                invoices={invoices}
+                onRepChange={() => {}}
+                currentUserUid={currentUser.uid}
+                selectedRepId={repsSelectedRepId}
+                setSelectedRepId={setRepsSelectedRepId}
+                activeTab={repsActiveSubTab}
+                setActiveTab={setRepsActiveSubTab}
+                repProductSearch={repsProductSearch}
+                setRepProductSearch={setRepsProductSearch}
+                expandedProductId={repsExpandedProductId}
+                setExpandedProductId={setRepsExpandedProductId}
+              />
+            )}
             {activeTab === "pos-import" && <POSImport onImportComplete={() => setActiveTab("catalog")} existingProductIds={products.map(p => p.id)} />}
             {activeTab === "alerts" && <LowStockAlerts products={lowStockProducts} reps={reps} currentUserUid={currentUser.uid} onNavigateToCatalog={() => setActiveTab("catalog")} />}
           </motion.div>

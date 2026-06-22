@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useEffect } from "react";
-import { Users as UsersIcon, Phone as PhoneIcon, Mail as MailIcon, Calendar as CalendarIcon, PlusCircle as PlusIcon, CheckCircle as CheckIcon, Calculator as CalcIcon, AlertTriangle as AlertIcon, FileSpreadsheet as SheetIcon, Copy as CopyIcon, Printer as PrinterIcon, Loader2 as LoaderIcon, AlertCircle as AlertCircleIcon, Edit2, Trash2, Save, X, Search, TrendingUp, TrendingDown, Minus, FileText, Package } from "lucide-react";
-import { collection, doc, setDoc, getDocs, updateDoc, deleteDoc, serverTimestamp, query, where, writeBatch } from "firebase/firestore";
+import { Users as UsersIcon, Phone as PhoneIcon, Mail as MailIcon, Calendar as CalendarIcon, PlusCircle as PlusIcon, CheckCircle as CheckIcon, Calculator as CalcIcon, AlertTriangle as AlertIcon, FileSpreadsheet as SheetIcon, Copy as CopyIcon, Printer as PrinterIcon, Loader2 as LoaderIcon, AlertCircle as AlertCircleIcon, Edit2, Trash2, Save, X, Search, TrendingUp, TrendingDown, Minus, FileText, Package, History as HistoryIcon } from "lucide-react";
+import { collection, doc, setDoc, getDocs, getDoc, updateDoc, deleteDoc, serverTimestamp, query, where, writeBatch, arrayUnion } from "firebase/firestore";
 import { db, handleFirestoreError, OperationType } from "../firebase";
 import { Rep, Visit, Product, PriceEntry, Invoice } from "../types";
 import { motion } from "motion/react";
@@ -35,6 +35,17 @@ interface PriceEditForm {
   discPercent: string;
   boxPrice: string;
   packQuantity: string;
+}
+
+// One snapshot of a price entry's values right before a correction was
+// saved. Stored append-only on the price entry's editHistory array so the
+// old value is never lost — only the current displayed values change.
+interface PriceEditHistoryItem {
+  editedAt: string;
+  previousUnitPrice: number | null;
+  previousDiscPercent: number | null;
+  previousBoxPrice: number;
+  previousPackQuantity: number | null;
 }
 
 export default function RepDirectory({
@@ -170,10 +181,12 @@ export default function RepDirectory({
   // packQuantity, unitPrice, and discPercent are passed through exactly as
   // extracted/computed in DocketScanner.tsx, OR as subsequently corrected
   // via the edit modal — no calculation happens in this memo itself.
-  // Also exposes the latest entry's own document id (latestEntryId) so the
-  // per-row edit/delete buttons know exactly which Firestore doc to touch.
+  // Also exposes the latest entry's own document id (latestEntryId) and
+  // editHistory so the per-row edit/delete buttons and the audit-trail
+  // expand row know exactly which Firestore doc to touch and what past
+  // corrections (if any) to display.
   const productPriceData = useMemo(() => {
-    const data: { [productId: string]: { current: number; previous: number | null; change: number | null; changePct: number | null; packQuantity: number | null; unitPrice: number | null; discPercent: number | null; effectiveDate: any; latestEntryId: string } } = {};
+    const data: { [productId: string]: { current: number; previous: number | null; change: number | null; changePct: number | null; packQuantity: number | null; unitPrice: number | null; discPercent: number | null; effectiveDate: any; latestEntryId: string; editHistory: PriceEditHistoryItem[] } } = {};
 
     repSuppliedProductIds.forEach(productId => {
       const entries = priceEntries
@@ -195,8 +208,9 @@ export default function RepDirectory({
       const discPercent = (entries[0] as any).discPercent ?? null;
       const effectiveDate = entries[0].effectiveDate;
       const latestEntryId = entries[0].id;
+      const editHistory: PriceEditHistoryItem[] = (entries[0] as any).editHistory ?? [];
 
-      data[productId] = { current, previous, change, changePct, packQuantity, unitPrice, discPercent, effectiveDate, latestEntryId };
+      data[productId] = { current, previous, change, changePct, packQuantity, unitPrice, discPercent, effectiveDate, latestEntryId, editHistory };
     });
 
     return data;
@@ -358,6 +372,12 @@ export default function RepDirectory({
   // independent — editing one does NOT recompute or overwrite another.
   // Per Unit / Per Unit (+GST) are not stored; they're always derived live
   // from boxPrice/packQuantity wherever they're displayed.
+  //
+  // Before overwriting, this reads the document's CURRENT values and
+  // appends them (with a timestamp) to editHistory via arrayUnion — so the
+  // old value is never lost, only ever added to. Display logic elsewhere
+  // is unaffected since this is purely an additive field nothing else reads
+  // except the audit-trail expand row.
   const handleSavePriceEdit = async () => {
     if (!editingPrice) return;
 
@@ -386,6 +406,12 @@ export default function RepDirectory({
     setIsSavingPriceEdit(true);
     setPriceEditError(null);
     try {
+      const priceDocRef = doc(db, "prices", editingPrice.priceEntryId);
+
+      // Snapshot the CURRENT (pre-edit) values before overwriting them.
+      const currentSnap = await getDoc(priceDocRef);
+      const currentData = currentSnap.exists() ? currentSnap.data() : null;
+
       const updatePayload: any = {
         price: parsedBoxPrice,
         packQuantity: parsedPackQuantity
@@ -396,7 +422,34 @@ export default function RepDirectory({
       if (editingPrice.unitPrice.trim()) updatePayload.unitPrice = parsedUnitPrice;
       if (editingPrice.discPercent.trim()) updatePayload.discPercent = parsedDiscPercent;
 
-      await updateDoc(doc(db, "prices", editingPrice.priceEntryId), updatePayload);
+      // Only record history if something actually changed — avoids logging
+      // a no-op "edit" if the manager opened the modal and saved without
+      // changing anything.
+      if (currentData) {
+        const priorBoxPrice = currentData.price;
+        const priorPackQuantity = currentData.packQuantity ?? null;
+        const priorUnitPrice = currentData.unitPrice ?? null;
+        const priorDiscPercent = currentData.discPercent ?? null;
+
+        const somethingChanged =
+          priorBoxPrice !== parsedBoxPrice ||
+          priorPackQuantity !== parsedPackQuantity ||
+          (editingPrice.unitPrice.trim() && priorUnitPrice !== parsedUnitPrice) ||
+          (editingPrice.discPercent.trim() && priorDiscPercent !== parsedDiscPercent);
+
+        if (somethingChanged) {
+          const historyItem: PriceEditHistoryItem = {
+            editedAt: new Date().toISOString(),
+            previousUnitPrice: priorUnitPrice,
+            previousDiscPercent: priorDiscPercent,
+            previousBoxPrice: priorBoxPrice,
+            previousPackQuantity: priorPackQuantity
+          };
+          updatePayload.editHistory = arrayUnion(historyItem);
+        }
+      }
+
+      await updateDoc(priceDocRef, updatePayload);
       setEditingPrice(null);
       onRepChange();
     } catch (err) {
@@ -749,7 +802,7 @@ export default function RepDirectory({
                   ) : (
                     <>
                     <p className="text-[9px] text-slate-400 pl-1">
-                      "Box Price" and "Per Unit" are wholesale, <strong>excluding GST</strong>. "Per Unit (+GST)" includes the 15% GST applied on top — use that figure when setting retail prices. Made a mistake? Click the pencil icon to fix any field.
+                      "Box Price" and "Per Unit" are wholesale, <strong>excluding GST</strong>. "Per Unit (+GST)" includes the 15% GST applied on top. Click the calculator icon to see the docket calculation and any past corrections. Click the pencil icon to fix any field.
                     </p>
                     <div className="overflow-x-auto border border-slate-200 rounded max-h-80 overflow-y-auto">
                       <table className="w-full text-left text-[10px]">
@@ -772,6 +825,8 @@ export default function RepDirectory({
                             const pd = productPriceData[p.id];
                             const isExpanded = expandedProductId === p.id;
                             const hasAuditTrail = pd?.unitPrice != null;
+                            const hasEditHistory = pd?.editHistory && pd.editHistory.length > 0;
+                            const canExpand = hasAuditTrail || hasEditHistory;
                             const isFreePromo = (pd?.discPercent ?? 0) >= 100;
                             const isConfirmingDelete = pd?.latestEntryId && confirmDeletePriceId === pd.latestEntryId;
                             return (
@@ -784,10 +839,10 @@ export default function RepDirectory({
                                   <td className="p-1.5 px-2 text-right font-bold font-mono text-slate-800">
                                     <div className="flex items-center justify-end gap-1">
                                       <span className={isFreePromo ? "text-amber-700" : ""}>${pd?.current?.toFixed(2) || "—"}</span>
-                                      {hasAuditTrail && (
+                                      {canExpand && (
                                         <button
                                           onClick={() => setExpandedProductId(isExpanded ? null : p.id)}
-                                          title="Show how this price was calculated"
+                                          title="Show docket calculation and edit history"
                                           className="text-slate-400 hover:text-emerald-600 cursor-pointer"
                                         >
                                           <CalcIcon className="h-2.5 w-2.5" />
@@ -868,18 +923,41 @@ export default function RepDirectory({
                                     </td>
                                   </tr>
                                 )}
-                                {isExpanded && hasAuditTrail && (
+                                {isExpanded && canExpand && (
                                   <tr className={isFreePromo ? "bg-amber-50" : "bg-emerald-50/40"}>
-                                    <td colSpan={10} className={`p-1.5 px-2 text-[9px] ${isFreePromo ? "text-amber-800" : "text-emerald-800"}`}>
-                                      <span className="font-bold">From docket:</span>{" "}
-                                      ${pd!.unitPrice!.toFixed(2)} unit price × (1 − {pd!.discPercent ?? 0}% disc) = ${pd!.current?.toFixed(2)} box price (excl. GST)
-                                      {isFreePromo && (
-                                        <span className="ml-1.5 font-bold">— 100% discount, likely free/promo. Do not use for retail pricing.</span>
+                                    <td colSpan={10} className={`p-1.5 px-2 text-[9px] ${isFreePromo ? "text-amber-800" : "text-emerald-800"} space-y-1.5`}>
+                                      {hasAuditTrail && (
+                                        <div>
+                                          <span className="font-bold">From docket:</span>{" "}
+                                          ${pd!.unitPrice!.toFixed(2)} unit price × (1 − {pd!.discPercent ?? 0}% disc) = ${pd!.current?.toFixed(2)} box price (excl. GST)
+                                          {isFreePromo && (
+                                            <span className="ml-1.5 font-bold">— 100% discount, likely free/promo. Do not use for retail pricing.</span>
+                                          )}
+                                          {pd?.effectiveDate && (
+                                            <span className={`ml-2 ${isFreePromo ? "text-amber-600" : "text-emerald-600"}`}>
+                                              · Scanned {new Date(pd.effectiveDate?.seconds ? pd.effectiveDate.seconds * 1000 : pd.effectiveDate).toLocaleDateString()}
+                                            </span>
+                                          )}
+                                        </div>
                                       )}
-                                      {pd?.effectiveDate && (
-                                        <span className={`ml-2 ${isFreePromo ? "text-amber-600" : "text-emerald-600"}`}>
-                                          · Scanned {new Date(pd.effectiveDate?.seconds ? pd.effectiveDate.seconds * 1000 : pd.effectiveDate).toLocaleDateString()}
-                                        </span>
+                                      {hasEditHistory && (
+                                        <div className={hasAuditTrail ? "pt-1.5 border-t border-emerald-100" : ""}>
+                                          <span className="font-bold flex items-center gap-1">
+                                            <HistoryIcon className="h-2.5 w-2.5" />
+                                            Edit history ({pd.editHistory.length} correction{pd.editHistory.length > 1 ? "s" : ""}):
+                                          </span>
+                                          <ul className="mt-1 space-y-0.5">
+                                            {[...pd.editHistory].reverse().map((h, i) => (
+                                              <li key={i} className="pl-3">
+                                                {new Date(h.editedAt).toLocaleDateString()} {new Date(h.editedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} —{" "}
+                                                Box Price was <strong>${h.previousBoxPrice.toFixed(2)}</strong>
+                                                {h.previousPackQuantity != null && <>, Units/Box was <strong>{h.previousPackQuantity}</strong></>}
+                                                {h.previousUnitPrice != null && <>, Unit Price was <strong>${h.previousUnitPrice.toFixed(2)}</strong></>}
+                                                {h.previousDiscPercent != null && <>, Disc% was <strong>{h.previousDiscPercent}%</strong></>}
+                                              </li>
+                                            ))}
+                                          </ul>
+                                        </div>
                                       )}
                                     </td>
                                   </tr>
@@ -1106,7 +1184,7 @@ export default function RepDirectory({
               </div>
 
               <p className="text-[8px] text-slate-400">
-                Each field is saved exactly as entered — editing one does not recalculate another. Unit Price / Disc% are kept for reference; Box Price and Units/Box are what's actually used everywhere else.
+                Each field is saved exactly as entered — editing one does not recalculate another. Unit Price / Disc% are kept for reference; Box Price and Units/Box are what's actually used everywhere else. The previous values are kept in this product's edit history.
               </p>
 
               {editPreview && (

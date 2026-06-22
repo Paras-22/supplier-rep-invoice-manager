@@ -520,7 +520,7 @@ export default function App() {
               />
             )}
             {activeTab === "pos-import" && <POSImport onImportComplete={() => setActiveTab("catalog")} existingProductIds={products.map(p => p.id)} />}
-            {activeTab === "alerts" && <LowStockAlerts products={lowStockProducts} reps={reps} currentUserUid={currentUser.uid} onNavigateToCatalog={() => setActiveTab("catalog")} />}
+            {activeTab === "alerts" && <LowStockAlerts products={lowStockProducts} reps={reps} priceEntries={priceEntries} currentUserUid={currentUser.uid} onNavigateToCatalog={() => setActiveTab("catalog")} />}
           </motion.div>
         </AnimatePresence>
       </main>

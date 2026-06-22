@@ -1,23 +1,42 @@
 import React, { useState, useMemo } from "react";
-import { AlertTriangle, ShieldCheck, ArrowRight, Phone, Mail, ChevronRight, RefreshCw, ShoppingCart, SlidersHorizontal, Package, Check, Sparkles } from "lucide-react";
+import { AlertTriangle, ShieldCheck, ArrowRight, Phone, Mail, ChevronRight, RefreshCw, ShoppingCart, SlidersHorizontal, Package, Check, Sparkles, TrendingUp, Printer, Copy } from "lucide-react";
 import { doc, updateDoc, setDoc, collection, serverTimestamp } from "firebase/firestore";
 import { db, handleFirestoreError, OperationType } from "../firebase";
-import { Product, Rep, Order, OrderItem } from "../types";
+import { Product, Rep, Order, OrderItem, PriceEntry } from "../types";
 import { motion } from "motion/react";
 
 interface LowStockAlertsProps {
   products: Product[];
   reps: Rep[];
+  priceEntries: PriceEntry[];
   currentUserUid: string;
   onNavigateToCatalog: () => void;
 }
 
-export default function LowStockAlerts({ products, reps, currentUserUid, onNavigateToCatalog }: LowStockAlertsProps) {
+// One detected price increase, ready to display in the sorted list.
+interface PriceIncreaseAlert {
+  productId: string;
+  productName: string;
+  repId: string;
+  repName: string;
+  repCompany: string;
+  previousPrice: number;
+  currentPrice: number;
+  dollarChange: number;
+  percentChange: number;
+  effectiveDate: any;
+}
+
+export default function LowStockAlerts({ products, reps, priceEntries, currentUserUid, onNavigateToCatalog }: LowStockAlertsProps) {
   const [filterCategory, setFilterCategory] = useState<string>("all");
   const [searchQuery, setSearchQuery] = useState("");
   const [quantitiesToRefill, setQuantitiesToRefill] = useState<{ [prodId: string]: number }>({});
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [actionInProgressId, setActionInProgressId] = useState<string | null>(null);
+  // Relabeling sheet state: tracks whether the print preview modal is open,
+  // and whether the "Copied!" confirmation should briefly show.
+  const [showRelabelPrint, setShowRelabelPrint] = useState(false);
+  const [copiedRelabelList, setCopiedRelabelList] = useState(false);
 
   // Categories extracted dynamically
   const categories = useMemo(() => {
@@ -55,6 +74,80 @@ export default function LowStockAlerts({ products, reps, currentUserUid, onNavig
       return true;
     });
   }, [products, filterCategory, searchQuery]);
+
+  // Scans ALL price history across every product+rep combination, finds
+  // every case where the latest recorded price is higher than the one
+  // immediately before it, and returns those as a sorted list (biggest %
+  // jump first). No time window or size threshold — every increase ever
+  // recorded shows up here, by design (kept simple deliberately).
+  const priceIncreases = useMemo(() => {
+    const groups: { [key: string]: PriceEntry[] } = {};
+
+    priceEntries.forEach(entry => {
+      const key = `${entry.productId}__${entry.repId}`;
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(entry);
+    });
+
+    const increases: PriceIncreaseAlert[] = [];
+
+    Object.entries(groups).forEach(([key, entries]) => {
+      if (entries.length < 2) return;
+
+      const sorted = [...entries].sort((a, b) => {
+        const timeA = a.effectiveDate?.seconds ? a.effectiveDate.seconds * 1000 : new Date(a.effectiveDate).getTime();
+        const timeB = b.effectiveDate?.seconds ? b.effectiveDate.seconds * 1000 : new Date(b.effectiveDate).getTime();
+        return timeB - timeA;
+      });
+
+      const current = sorted[0];
+      const previous = sorted[1];
+
+      if (current.price > previous.price) {
+        const [productId, repId] = key.split("__");
+        const product = products.find(p => p.id === productId);
+        const rep = reps.find(r => r.id === repId);
+
+        const dollarChange = current.price - previous.price;
+        const percentChange = previous.price > 0 ? (dollarChange / previous.price) * 100 : 0;
+
+        increases.push({
+          productId,
+          productName: product?.name || productId,
+          repId,
+          repName: rep?.name || "Unknown Rep",
+          repCompany: rep?.company || "Unknown",
+          previousPrice: previous.price,
+          currentPrice: current.price,
+          dollarChange,
+          percentChange,
+          effectiveDate: current.effectiveDate
+        });
+      }
+    });
+
+    return increases.sort((a, b) => b.percentChange - a.percentChange);
+  }, [priceEntries, products, reps]);
+
+  // Builds the same Product / Old / New / Rep / % info as the on-screen
+  // table into a plain-text block, and copies it to the clipboard — same
+  // pattern as the purchase-order copy button in RepDirectory.
+  const handleCopyRelabelList = () => {
+    if (priceIncreases.length === 0) return;
+    let output = `--- CHAPEL DOWNS SUPERMARKET - PRICE CHANGES (UPDATE SHELF TAGS) ---\n`;
+    output += `Generated: ${new Date().toLocaleString()}\n`;
+    output += `--------------------------------------------------\n`;
+    priceIncreases.forEach((inc, idx) => {
+      output += `${idx + 1}. ${inc.productName}\n`;
+      output += `   Was $${inc.previousPrice.toFixed(2)} -> Now $${inc.currentPrice.toFixed(2)} (+${inc.percentChange.toFixed(1)}%)\n`;
+      output += `   Rep: ${inc.repName} (${inc.repCompany})\n`;
+    });
+    output += `--------------------------------------------------\n`;
+    output += `Total products with price increases: ${priceIncreases.length}\n`;
+    navigator.clipboard.writeText(output);
+    setCopiedRelabelList(true);
+    setTimeout(() => setCopiedRelabelList(false), 3000);
+  };
 
   // Quick inline stock updates
   const handleModifyStock = async (productId: string, newQty: number, minLevel: number) => {
@@ -179,18 +272,19 @@ export default function LowStockAlerts({ products, reps, currentUserUid, onNavig
           <p className="text-[9px] text-emerald-600 mt-1 leading-tight font-sans">Portion of master database currently in compliance with standard levels.</p>
         </div>
 
-        <div className="bg-slate-900 text-white rounded p-3 text-left relative overflow-hidden">
+        <div className="bg-amber-50 border border-amber-200 rounded p-3 text-left relative overflow-hidden">
           <div className="absolute right-2.5 bottom-2 opacity-10">
-            <Sparkles className="h-16 w-16 text-emerald-400" />
+            <TrendingUp className="h-16 w-16 text-amber-600" />
           </div>
           <div className="flex items-center justify-between">
-            <span className="text-[10px] uppercase font-bold tracking-wider text-slate-350">Quick Stock Replenish</span>
-            <ShoppingCart className="h-4 w-4 text-emerald-400" />
+            <span className="text-[10px] uppercase font-bold tracking-wider text-amber-800">Price Increases</span>
+            <TrendingUp className="h-4 w-4 text-amber-700" />
           </div>
-          <div className="mt-2.5">
-            <p className="text-[11px] font-bold text-slate-100">Spawn Requisitions Instantly</p>
-            <p className="text-[9px] text-slate-350 mt-1 leading-tight">Generate pending draft requisitions linked straight to registered factory reps.</p>
+          <div className="flex items-baseline gap-1.5 mt-2">
+            <span className="text-xl font-extrabold text-amber-950 font-mono">{priceIncreases.length}</span>
+            <span className="text-[9px] text-amber-700 font-sans">supplier prices have gone up</span>
           </div>
+          <p className="text-[9px] text-amber-600 mt-1 leading-tight font-sans">Across every rep and product on file, biggest jump first.</p>
         </div>
 
       </div>
@@ -243,6 +337,82 @@ export default function LowStockAlerts({ products, reps, currentUserUid, onNavig
           {successMessage}
         </motion.div>
       )}
+
+      {/* PRICE INCREASE ALERTS */}
+      <div className="bg-white rounded border border-slate-200 overflow-hidden" id="price_increase_panel">
+        <div className="p-3 bg-amber-50 border-b border-amber-200 flex items-center justify-between gap-2 flex-wrap">
+          <div className="text-left leading-tight">
+            <h3 className="text-[11px] font-bold text-amber-900 flex items-center gap-1">
+              <TrendingUp className="h-3.5 w-3.5" />
+              Supplier Price Increases
+            </h3>
+            <p className="text-[9px] text-amber-700">Every product where the latest recorded price is higher than the one before it, sorted by biggest jump first.</p>
+          </div>
+          {priceIncreases.length > 0 && (
+            <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                onClick={handleCopyRelabelList}
+                className="px-2 py-1 bg-white hover:bg-amber-100 border border-amber-300 text-amber-800 rounded text-[9px] font-bold flex items-center gap-1 cursor-pointer transition-colors"
+              >
+                {copiedRelabelList ? <><Check className="h-3 w-3" /><span>Copied!</span></> : <><Copy className="h-3 w-3" /><span>Copy List</span></>}
+              </button>
+              <button
+                onClick={() => setShowRelabelPrint(true)}
+                className="px-2 py-1 bg-amber-700 hover:bg-amber-800 text-white rounded text-[9px] font-bold flex items-center gap-1 cursor-pointer transition-colors"
+              >
+                <Printer className="h-3 w-3" /><span>Print Relabel Sheet</span>
+              </button>
+            </div>
+          )}
+        </div>
+
+        {priceIncreases.length === 0 ? (
+          <div className="p-8 text-center flex flex-col items-center justify-center">
+            <div className="bg-emerald-50 rounded-full p-2.5 text-emerald-600 mb-2">
+              <ShieldCheck className="h-5 w-5 stroke-[2px]" />
+            </div>
+            <h3 className="text-xs font-bold text-slate-800">No price increases on file</h3>
+            <p className="text-[10px] text-slate-400 mt-0.5 max-w-sm leading-normal">
+              Every product's latest price is the same as or lower than its previous price, across all reps.
+            </p>
+          </div>
+        ) : (
+          <div className="overflow-x-auto max-h-80 overflow-y-auto">
+            <table className="w-full text-left text-[10px] font-sans">
+              <thead className="sticky top-0 z-10">
+                <tr className="bg-slate-50 border-b border-slate-200 text-slate-500 uppercase font-bold text-[8px] tracking-wider leading-none">
+                  <th className="p-2 px-3">Product</th>
+                  <th className="p-2 px-3">Rep</th>
+                  <th className="p-2 px-3 text-right">Was</th>
+                  <th className="p-2 px-3 text-right">Now</th>
+                  <th className="p-2 px-3 text-right">Change</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {priceIncreases.map((inc, idx) => (
+                  <tr key={`${inc.productId}-${inc.repId}-${idx}`} className="hover:bg-amber-50/30">
+                    <td className="p-2 px-3">
+                      <p className="font-bold text-slate-800 line-clamp-1">{inc.productName}</p>
+                      <p className="text-[8px] text-slate-400 font-mono">{inc.productId}</p>
+                    </td>
+                    <td className="p-2 px-3">
+                      <p className="font-semibold text-slate-700 leading-tight">{inc.repName}</p>
+                      <p className="text-[8px] text-slate-400 uppercase">{inc.repCompany}</p>
+                    </td>
+                    <td className="p-2 px-3 text-right font-mono text-slate-400">${inc.previousPrice.toFixed(2)}</td>
+                    <td className="p-2 px-3 text-right font-mono font-bold text-slate-800">${inc.currentPrice.toFixed(2)}</td>
+                    <td className="p-2 px-3 text-right">
+                      <span className="font-bold text-[9px] text-rose-700 bg-rose-50 border border-rose-200 px-1.5 py-0.5 rounded">
+                        +${inc.dollarChange.toFixed(2)} (+{inc.percentChange.toFixed(1)}%)
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
 
       {/* DETAILED ACTIVE COMPLIANCE SHIELD / ALERTS LIST */}
       <div className="bg-white rounded border border-slate-200 overflow-hidden" id="alerts_table_panel">
@@ -413,6 +583,74 @@ export default function LowStockAlerts({ products, reps, currentUserUid, onNavig
           </div>
         )}
       </div>
+
+      {/* RELABEL PRINT MODAL */}
+      {showRelabelPrint && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 p-4 overflow-y-auto">
+          <div className="bg-white rounded-lg shadow-2xl border border-slate-200 w-full max-w-3xl p-6 relative max-h-[90vh] overflow-y-auto flex flex-col">
+            <div className="flex items-center justify-between border-b border-slate-200 pb-3 mb-4 no-print">
+              <div className="flex items-center gap-2">
+                <Printer className="h-4 w-4 text-amber-700" />
+                <h2 className="text-xs font-extrabold text-slate-800 uppercase tracking-wider">Price Changes — Relabel Sheet</h2>
+              </div>
+              <div className="flex items-center gap-2">
+                <button onClick={() => window.print()} className="p-1.5 px-3 bg-amber-700 hover:bg-amber-800 text-white rounded text-[11px] font-bold flex items-center gap-1.5 cursor-pointer">
+                  <Printer className="h-3.5 w-3.5" /><span>Print</span>
+                </button>
+                <button onClick={() => setShowRelabelPrint(false)} className="p-1.5 px-3 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-[11px] font-bold cursor-pointer border border-slate-200">Close</button>
+              </div>
+            </div>
+
+            <div id="printable-relabel-area" className="flex-1 bg-white text-slate-900 p-6 rounded border border-slate-200 font-sans">
+              <style>{`@media print { body * { visibility: hidden !important; } #printable-relabel-area, #printable-relabel-area * { visibility: visible !important; } #printable-relabel-area { position: absolute !important; left: 0 !important; top: 0 !important; width: 100% !important; padding: 40px !important; } }`}</style>
+
+              <div className="border-b-4 border-amber-700 pb-3 mb-6 flex items-center justify-between">
+                <div>
+                  <h1 className="text-lg font-black text-amber-800 tracking-wider">CHAPEL DOWNS SUPERMARKET</h1>
+                  <p className="text-[9px] text-slate-500 uppercase tracking-widest font-semibold">Price Changes — Update Shelf Tags</p>
+                </div>
+                <div className="text-right">
+                  <span className="text-[9px] font-mono font-bold bg-slate-100 text-slate-700 px-2 py-0.5 rounded">{priceIncreases.length} Products</span>
+                  <p className="text-[8px] font-mono text-slate-400 mt-1">Printed: {new Date().toLocaleString()}</p>
+                </div>
+              </div>
+
+              <table className="w-full text-[10px] border-collapse">
+                <thead>
+                  <tr className="bg-slate-50 border-b border-slate-200 text-[8px] uppercase text-slate-500 font-bold">
+                    <th className="p-2 text-left">#</th>
+                    <th className="p-2 text-left">Product</th>
+                    <th className="p-2 text-left">Rep</th>
+                    <th className="p-2 text-right">Old Price</th>
+                    <th className="p-2 text-right">New Price</th>
+                    <th className="p-2 text-right">Change</th>
+                    <th className="p-2 text-center">Done?</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-150">
+                  {priceIncreases.map((inc, idx) => (
+                    <tr key={`${inc.productId}-${inc.repId}-${idx}`}>
+                      <td className="p-2 text-slate-400 font-mono">{idx + 1}</td>
+                      <td className="p-2 font-semibold text-slate-800">{inc.productName}</td>
+                      <td className="p-2 text-slate-600">{inc.repName} ({inc.repCompany})</td>
+                      <td className="p-2 text-right font-mono text-slate-400">${inc.previousPrice.toFixed(2)}</td>
+                      <td className="p-2 text-right font-mono font-bold">${inc.currentPrice.toFixed(2)}</td>
+                      <td className="p-2 text-right font-bold text-rose-700">+{inc.percentChange.toFixed(1)}%</td>
+                      <td className="p-2 text-center">
+                        <span className="inline-block w-3.5 h-3.5 border border-slate-400 rounded-sm"></span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+
+              <div className="mt-8 border-t border-dashed border-slate-300 pt-4 text-[9px] text-slate-400">
+                Chapel Downs Supermarket — Confidential procurement document. Check the box once a shelf tag has been updated.
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
     </div>
   );

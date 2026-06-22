@@ -1,4 +1,4 @@
-import React, { useEffect } from "react";
+import React, { useEffect, useRef } from "react";
 import { Search, Star, AlertTriangle, History, Landmark, PlusCircle, Bookmark, CheckCircle, Package } from "lucide-react";
 import { collection, doc, setDoc, updateDoc, serverTimestamp, query, where, getDocs, limit } from "firebase/firestore";
 import { db, handleFirestoreError, OperationType } from "../firebase";
@@ -41,6 +41,14 @@ export default function ProductCatalog({
   const [minStockInput, setMinStockInput] = useState<string>("");
   const [stockSuccess, setStockSuccess] = useState(false);
 
+  // Reference to the product detail panel container. When a product is
+  // tapped on mobile, the scroll position otherwise stays exactly where it
+  // was — often still showing the search results list — leaving no visual
+  // cue that anything happened until the user manually scrolls down. This
+  // ref lets us smooth-scroll the detail panel into view right after
+  // selection, same pattern used for rep selection in RepDirectory.
+  const productDetailRef = useRef<HTMLDivElement>(null);
+
   useEffect(() => {
     const searchProducts = async () => {
       if (!searchQuery.trim() || searchQuery.trim().length < 2) {
@@ -77,6 +85,16 @@ export default function ProductCatalog({
   const selectedProduct = useMemo(() => {
     return searchResults.find(p => p.id === selectedProductId) || null;
   }, [searchResults, selectedProductId]);
+
+  // Selects a product and smooth-scrolls the detail panel into view. The
+  // small delay lets selectedProduct (which depends on selectedProductId)
+  // actually update and render before we try to scroll to its container.
+  const handleSelectProduct = (productId: string) => {
+    setSelectedProductId(productId);
+    setTimeout(() => {
+      productDetailRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 50);
+  };
 
   const productPriceHistory = useMemo(() => {
     if (!selectedProductId) return [];
@@ -239,7 +257,7 @@ export default function ProductCatalog({
             searchResults.map(p => (
               <div
                 key={p.id}
-                onClick={() => setSelectedProductId(p.id)}
+                onClick={() => handleSelectProduct(p.id)}
                 className={`p-2 rounded border text-left cursor-pointer transition-all ${
                   selectedProductId === p.id
                     ? "border-emerald-500 bg-emerald-50/30 font-medium"
@@ -262,7 +280,7 @@ export default function ProductCatalog({
 
       <div className="lg:col-span-8 space-y-3">
         {selectedProduct ? (
-          <div className="bg-white rounded-md shadow-sm border border-slate-200 p-4 space-y-4 text-left">
+          <div ref={productDetailRef} className="bg-white rounded-md shadow-sm border border-slate-200 p-4 space-y-4 text-left">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-2.5 border-b border-slate-150">
               <div>
                 <span className="text-[9px] uppercase font-bold tracking-wider text-emerald-700 bg-emerald-50 px-1.5 py-0.5 rounded">

@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from "react";
+import React, { useState, useMemo, useEffect, useRef } from "react";
 import { Users as UsersIcon, Phone as PhoneIcon, Mail as MailIcon, Calendar as CalendarIcon, PlusCircle as PlusIcon, CheckCircle as CheckIcon, Calculator as CalcIcon, AlertTriangle as AlertIcon, FileSpreadsheet as SheetIcon, Copy as CopyIcon, Printer as PrinterIcon, Loader2 as LoaderIcon, AlertCircle as AlertCircleIcon, Edit2, Trash2, Save, X, Search, TrendingUp, TrendingDown, Minus, FileText, Package, History as HistoryIcon } from "lucide-react";
 import { collection, doc, setDoc, getDocs, getDoc, updateDoc, deleteDoc, serverTimestamp, query, where, writeBatch, arrayUnion } from "firebase/firestore";
 import { db, handleFirestoreError, OperationType } from "../firebase";
@@ -112,6 +112,13 @@ export default function RepDirectory({
 
   // Order state
   const [orderQtys, setOrderQtys] = useState<{ [prodId: string]: number }>({});
+
+  // Reference to the rep detail panel container. When a rep is tapped on
+  // mobile, the scroll position otherwise stays exactly where it was —
+  // often still showing the rep LIST — leaving no visual cue that
+  // anything happened until the user manually scrolls down. This ref lets
+  // us smooth-scroll the detail panel into view right after selection.
+  const repDetailRef = useRef<HTMLDivElement>(null);
 
   const selectedRep = useMemo(() => reps.find(r => r.id === selectedRepId) || null, [reps, selectedRepId]);
 
@@ -252,6 +259,19 @@ export default function RepDirectory({
   }, [orderQtys, suppliedProducts, productPriceData]);
 
   // ── HANDLERS ──────────────────────────────────────────────────────────
+
+  // Selects a rep and smooth-scrolls the detail panel into view. The small
+  // delay lets selectedRep (which depends on selectedRepId) actually update
+  // and render before we try to scroll to its container.
+  const handleSelectRep = (repId: string) => {
+    setSelectedRepId(repId);
+    setShowEditForm(false);
+    setShowDeleteConfirm(false);
+    setActiveTab("products");
+    setTimeout(() => {
+      repDetailRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 50);
+  };
 
   const handleCreateRep = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -645,7 +665,7 @@ export default function RepDirectory({
                   return (
                     <div
                       key={r.id}
-                      onClick={() => { setSelectedRepId(r.id); setShowEditForm(false); setShowDeleteConfirm(false); setActiveTab("products"); }}
+                      onClick={() => handleSelectRep(r.id)}
                       className={`p-2 rounded border text-left cursor-pointer transition-all ${selectedRepId === r.id ? "border-emerald-500 bg-emerald-50/30" : "border-slate-100 hover:border-slate-250 hover:bg-slate-50/50"}`}
                     >
                       <p className="text-[8px] font-mono text-slate-400 uppercase tracking-tight">{r.company}</p>
@@ -672,7 +692,7 @@ export default function RepDirectory({
         {/* RIGHT — REP DETAIL */}
         <div className="lg:col-span-8 space-y-3">
           {selectedRep ? (
-            <div className="bg-white rounded-md shadow-sm border border-slate-200 p-4 space-y-4 text-left">
+            <div ref={repDetailRef} className="bg-white rounded-md shadow-sm border border-slate-200 p-4 space-y-4 text-left">
 
               {/* PROFILE HEADER */}
               <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3 pb-3 border-b border-slate-200">

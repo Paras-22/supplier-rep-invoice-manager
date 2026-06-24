@@ -23,17 +23,20 @@ interface RepDirectoryProps {
   setExpandedProductId: (value: string | null) => void;
 }
 
-// Shape of the in-progress edit form for a single price entry. All four
-// fields are independently editable — none of them auto-overwrite each
-// other on save. Per Unit / Per Unit (+GST) are NOT part of this form
-// since they're purely computed display values, derived live from
-// boxPrice and packQuantity.
+// Shape of the in-progress edit form for a single price entry. Unit Price,
+// Disc%, and Units/Box are independently editable — none of them
+// auto-overwrite each other on save. Box Price is INTENTIONALLY NOT part
+// of this form anymore — it's a computed, read-only value derived live as
+// Unit Price × (1 − Disc%/100), same formula used by the docket scanner.
+// This was previously a fourth independently-editable field, but allowing
+// Box Price to be set to a number that didn't match Unit Price × Disc%
+// created confusing, inconsistent entries — so it's now always trustworthy
+// and derived, never manually overridden.
 interface PriceEditForm {
   priceEntryId: string;
   productName: string;
   unitPrice: string;
   discPercent: string;
-  boxPrice: string;
   packQuantity: string;
 }
 
@@ -242,6 +245,11 @@ export default function RepDirectory({
     return { currentWeekTotal, lifetimeSpent };
   }, [invoices, selectedRepId]);
 
+  // NOTE: this still computes unitPrice/lineCost/totalCost internally —
+  // that's used for the in-app "Estimated Total" display in the Order
+  // Draft tab, which the manager DOES want to see for themselves. Only the
+  // text that gets copied/printed to share with someone else strips this
+  // out (see handleCopyOrderText and handlePrintPurchaseOrder below).
   const draftOrderSummary = useMemo(() => {
     let totals = 0;
     const itemsList: { name: string; qty: number; unitPrice: number; lineCost: number }[] = [];
@@ -375,53 +383,50 @@ export default function RepDirectory({
   };
 
   // Opens the edit modal for a given product's latest price entry,
-  // pre-filling the form with its current values.
+  // pre-filling the form with its current values. Box Price is no longer
+  // part of this form — it's shown live in the preview below, computed
+  // from whatever Unit Price / Disc% the form currently holds.
   const handleOpenPriceEdit = (productName: string, pd: { latestEntryId: string; unitPrice: number | null; discPercent: number | null; current: number; packQuantity: number | null }) => {
     setPriceEditError(null);
     setEditingPrice({
       priceEntryId: pd.latestEntryId,
       productName,
-      unitPrice: pd.unitPrice != null ? pd.unitPrice.toString() : "",
+      unitPrice: pd.unitPrice != null ? pd.unitPrice.toString() : pd.current.toString(),
       discPercent: pd.discPercent != null ? pd.discPercent.toString() : "0",
-      boxPrice: pd.current.toString(),
       packQuantity: pd.packQuantity != null ? pd.packQuantity.toString() : "1"
     });
   };
 
-  // Saves all four edited fields directly to Firestore. Each field is
-  // independent — editing one does NOT recompute or overwrite another.
-  // Per Unit / Per Unit (+GST) are not stored; they're always derived live
-  // from boxPrice/packQuantity wherever they're displayed.
+  // Saves Unit Price, Disc%, and Units/Box directly to Firestore. Box
+  // Price is no longer independently editable — it's ALWAYS computed here
+  // as Unit Price × (1 − Disc%/100), the same formula DocketScanner.tsx
+  // uses on initial scan. This guarantees Box Price can never drift out of
+  // sync with the Unit Price/Disc% it's supposed to represent.
   //
   // Before overwriting, this reads the document's CURRENT values and
   // appends them (with a timestamp) to editHistory via arrayUnion — so the
-  // old value is never lost, only ever added to. Display logic elsewhere
-  // is unaffected since this is purely an additive field nothing else reads
-  // except the audit-trail expand row.
+  // old value is never lost, only ever added to.
   const handleSavePriceEdit = async () => {
     if (!editingPrice) return;
 
     const parsedUnitPrice = parseFloat(editingPrice.unitPrice);
     const parsedDiscPercent = parseFloat(editingPrice.discPercent);
-    const parsedBoxPrice = parseFloat(editingPrice.boxPrice);
     const parsedPackQuantity = parseInt(editingPrice.packQuantity);
 
-    if (isNaN(parsedBoxPrice) || parsedBoxPrice < 0) {
-      setPriceEditError("Box Price must be a valid non-negative number.");
+    if (isNaN(parsedUnitPrice) || parsedUnitPrice < 0) {
+      setPriceEditError("Unit Price must be a valid non-negative number.");
+      return;
+    }
+    if (isNaN(parsedDiscPercent) || parsedDiscPercent < 0 || parsedDiscPercent > 100) {
+      setPriceEditError("Disc% must be between 0 and 100.");
       return;
     }
     if (isNaN(parsedPackQuantity) || parsedPackQuantity < 1) {
       setPriceEditError("Units/Box must be a whole number of at least 1.");
       return;
     }
-    if (editingPrice.unitPrice.trim() && (isNaN(parsedUnitPrice) || parsedUnitPrice < 0)) {
-      setPriceEditError("Unit Price must be a valid non-negative number, or left blank.");
-      return;
-    }
-    if (editingPrice.discPercent.trim() && (isNaN(parsedDiscPercent) || parsedDiscPercent < 0 || parsedDiscPercent > 100)) {
-      setPriceEditError("Disc% must be between 0 and 100.");
-      return;
-    }
+
+    const computedBoxPrice = Math.round(parsedUnitPrice * (1 - parsedDiscPercent / 100) * 100) / 100;
 
     setIsSavingPriceEdit(true);
     setPriceEditError(null);
@@ -433,14 +438,11 @@ export default function RepDirectory({
       const currentData = currentSnap.exists() ? currentSnap.data() : null;
 
       const updatePayload: any = {
-        price: parsedBoxPrice,
-        packQuantity: parsedPackQuantity
+        price: computedBoxPrice,
+        packQuantity: parsedPackQuantity,
+        unitPrice: parsedUnitPrice,
+        discPercent: parsedDiscPercent
       };
-      // Only write unitPrice/discPercent if something was actually entered —
-      // keeps them null/absent for entries that never had this data rather
-      // than forcing a 0 onto old manual entries that predate these fields.
-      if (editingPrice.unitPrice.trim()) updatePayload.unitPrice = parsedUnitPrice;
-      if (editingPrice.discPercent.trim()) updatePayload.discPercent = parsedDiscPercent;
 
       // Only record history if something actually changed — avoids logging
       // a no-op "edit" if the manager opened the modal and saved without
@@ -452,10 +454,10 @@ export default function RepDirectory({
         const priorDiscPercent = currentData.discPercent ?? null;
 
         const somethingChanged =
-          priorBoxPrice !== parsedBoxPrice ||
+          priorBoxPrice !== computedBoxPrice ||
           priorPackQuantity !== parsedPackQuantity ||
-          (editingPrice.unitPrice.trim() && priorUnitPrice !== parsedUnitPrice) ||
-          (editingPrice.discPercent.trim() && priorDiscPercent !== parsedDiscPercent);
+          priorUnitPrice !== parsedUnitPrice ||
+          priorDiscPercent !== parsedDiscPercent;
 
         if (somethingChanged) {
           const historyItem: PriceEditHistoryItem = {
@@ -557,20 +559,72 @@ export default function RepDirectory({
     printWindow.print();
   };
 
+  // Builds a plain-text purchase order with PRODUCT / QTY (BOXES) columns
+  // only — no unit prices, no line costs, no grand total. This text is
+  // meant to be shared externally (e.g. pasted to a rep via WhatsApp), and
+  // wholesale cost data should never leave the business this way.
   const handleCopyOrderText = () => {
     if (!selectedRep || draftOrderSummary.items.length === 0) return;
     let output = `--- CHAPEL DOWNS SUPERMARKET - PURCHASE ORDER ---\n`;
     output += `Rep: ${selectedRep.name} | Company: ${selectedRep.company}\n`;
     output += `Date: ${new Date().toLocaleDateString()}\n`;
     output += `--------------------------------------------------\n`;
+    output += `PRODUCT                          QTY (BOXES)\n`;
+    output += `--------------------------------------------------\n`;
     draftOrderSummary.items.forEach((item, idx) => {
-      output += `${idx + 1}. ${item.name} x${item.qty} @ $${item.unitPrice.toFixed(2)} = $${item.lineCost.toFixed(2)}\n`;
+      output += `${idx + 1}. ${item.name} x${item.qty}\n`;
     });
     output += `--------------------------------------------------\n`;
-    output += `TOTAL: NZD $${draftOrderSummary.totalCost.toFixed(2)}\n`;
     navigator.clipboard.writeText(output);
     setCopiedOrder(true);
     setTimeout(() => setCopiedOrder(false), 3000);
+  };
+
+  // Prints a clean purchase order page — same visual style as the existing
+  // Notepad print and Supplier Briefing Report (Chapel Downs header banner,
+  // simple table). Only Product name and Qty (Boxes) are shown — no
+  // wholesale prices, since this is meant to be handed/shown to a rep.
+  const handlePrintPurchaseOrder = () => {
+    if (!selectedRep || draftOrderSummary.items.length === 0) return;
+    const printWindow = window.open("", "_blank");
+    if (!printWindow) return;
+    const rowsHtml = draftOrderSummary.items.map((item, idx) => `
+      <tr>
+        <td class="idx">${idx + 1}</td>
+        <td class="name">${item.name}</td>
+        <td class="qty">${item.qty}</td>
+      </tr>
+    `).join("");
+    printWindow.document.write(`
+      <html><head><title>Purchase Order — ${selectedRep.name}</title>
+      <style>
+        body { font-family: Arial, sans-serif; padding: 40px; color: #000; }
+        h1 { font-size: 18px; border-bottom: 2px solid #000; padding-bottom: 8px; }
+        h2 { font-size: 13px; color: #555; margin-top: 4px; }
+        .meta { font-size: 11px; color: #777; margin-top: 16px; margin-bottom: 24px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+        th { text-align: left; font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; color: #666; border-bottom: 2px solid #333; padding: 8px 6px; }
+        th.qty { text-align: right; }
+        td { font-size: 13px; padding: 8px 6px; border-bottom: 1px solid #eee; }
+        td.idx { color: #999; width: 30px; }
+        td.qty { text-align: right; font-weight: bold; }
+        .footer { margin-top: 48px; border-top: 1px dashed #ccc; padding-top: 16px; font-size: 10px; color: #aaa; }
+      </style></head>
+      <body>
+        <h1>CHAPEL DOWNS SUPERMARKET</h1>
+        <h2>Purchase Order — ${selectedRep.name} (${selectedRep.company})</h2>
+        <div class="meta">Date: ${new Date().toLocaleDateString()}</div>
+        <table>
+          <thead>
+            <tr><th>#</th><th>Product</th><th class="qty">Qty (Boxes)</th></tr>
+          </thead>
+          <tbody>${rowsHtml}</tbody>
+        </table>
+        <div class="footer">Chapel Downs Supermarket — Supplier Rep & Invoice Manager</div>
+      </body></html>
+    `);
+    printWindow.document.close();
+    printWindow.print();
   };
 
   const priceChangeIcon = (change: number | null) => {
@@ -591,16 +645,20 @@ export default function RepDirectory({
     );
   };
 
-  // Live preview of Per Unit / Per Unit (+GST) inside the edit modal, based
-  // on whatever the form currently holds — purely for the manager's
-  // reference while editing, not saved anywhere.
+  // Live preview of Box Price / Per Unit / Per Unit (+GST) inside the edit
+  // modal, computed from whatever Unit Price, Disc%, and Units/Box the form
+  // currently holds. Box Price is no longer a separate input — this IS the
+  // value that gets saved on submit, shown here so the manager can see it
+  // before confirming.
   const editPreview = useMemo(() => {
     if (!editingPrice) return null;
-    const box = parseFloat(editingPrice.boxPrice);
+    const unitPrice = parseFloat(editingPrice.unitPrice);
+    const discPercent = parseFloat(editingPrice.discPercent);
     const pack = parseInt(editingPrice.packQuantity);
-    if (isNaN(box) || isNaN(pack) || pack <= 0) return null;
-    const perUnit = box / pack;
-    return { perUnit, perUnitGst: perUnit * 1.15 };
+    if (isNaN(unitPrice) || isNaN(discPercent) || isNaN(pack) || pack <= 0) return null;
+    const boxPrice = unitPrice * (1 - discPercent / 100);
+    const perUnit = boxPrice / pack;
+    return { boxPrice, perUnit, perUnitGst: perUnit * 1.15 };
   }, [editingPrice]);
 
   return (
@@ -1113,12 +1171,21 @@ export default function RepDirectory({
                             <span className="font-bold text-slate-500">Estimated Total:</span>
                             <span className="text-xs font-extrabold text-emerald-800">${draftOrderSummary.totalCost.toFixed(2)}</span>
                           </div>
-                          <button
-                            onClick={handleCopyOrderText}
-                            className="w-full py-1 bg-emerald-700 hover:bg-emerald-800 text-white text-[10px] font-semibold rounded flex items-center justify-center gap-1 cursor-pointer"
-                          >
-                            {copiedOrder ? <><CheckIcon className="h-3 w-3" /><span>Copied!</span></> : <><CopyIcon className="h-3 w-3" /><span>Copy Purchase Order</span></>}
-                          </button>
+                          <div className="grid grid-cols-2 gap-1.5">
+                            <button
+                              onClick={handleCopyOrderText}
+                              className="py-1 bg-emerald-700 hover:bg-emerald-800 text-white text-[10px] font-semibold rounded flex items-center justify-center gap-1 cursor-pointer"
+                            >
+                              {copiedOrder ? <><CheckIcon className="h-3 w-3" /><span>Copied!</span></> : <><CopyIcon className="h-3 w-3" /><span>Copy Order</span></>}
+                            </button>
+                            <button
+                              onClick={handlePrintPurchaseOrder}
+                              className="py-1 bg-slate-900 hover:bg-slate-800 text-white text-[10px] font-semibold rounded flex items-center justify-center gap-1 cursor-pointer"
+                            >
+                              <PrinterIcon className="h-3 w-3" /><span>Print Order</span>
+                            </button>
+                          </div>
+                          <p className="text-[8px] text-slate-400 text-center">Copy/Print only includes product names &amp; quantities — no prices.</p>
                         </div>
                       )}
                     </>
@@ -1164,35 +1231,26 @@ export default function RepDirectory({
             <div className="space-y-3">
               <div className="grid grid-cols-2 gap-3">
                 <div className="space-y-0.5">
-                  <label className="text-[9px] uppercase font-bold text-slate-400">Unit Price ($)</label>
+                  <label className="text-[9px] uppercase font-bold text-slate-400">Unit Price ($) *</label>
                   <input
-                    type="number" step="0.01"
-                    className="w-full text-[11px] p-1.5 bg-white border border-slate-200 rounded focus:outline-none focus:border-emerald-500 font-mono"
+                    type="number" step="0.01" required
+                    className="w-full text-[11px] p-1.5 bg-white border border-slate-200 rounded focus:outline-none focus:border-emerald-500 font-mono font-bold"
                     placeholder="Pre-discount box price"
                     value={editingPrice.unitPrice}
                     onChange={(e) => setEditingPrice({ ...editingPrice, unitPrice: e.target.value })}
                   />
                 </div>
                 <div className="space-y-0.5">
-                  <label className="text-[9px] uppercase font-bold text-slate-400">Disc %</label>
+                  <label className="text-[9px] uppercase font-bold text-slate-400">Disc % *</label>
                   <input
-                    type="number" step="0.01" min="0" max="100"
-                    className="w-full text-[11px] p-1.5 bg-white border border-slate-200 rounded focus:outline-none focus:border-emerald-500 font-mono"
+                    type="number" min="0" max="100" step="0.01" required
+                    className="w-full text-[11px] p-1.5 bg-white border border-slate-200 rounded focus:outline-none focus:border-emerald-500 font-mono font-bold"
                     placeholder="0"
                     value={editingPrice.discPercent}
                     onChange={(e) => setEditingPrice({ ...editingPrice, discPercent: e.target.value })}
                   />
                 </div>
-                <div className="space-y-0.5">
-                  <label className="text-[9px] uppercase font-bold text-slate-400">Box Price ($) *</label>
-                  <input
-                    type="number" step="0.01" required
-                    className="w-full text-[11px] p-1.5 bg-white border border-slate-200 rounded focus:outline-none focus:border-emerald-500 font-mono font-bold"
-                    value={editingPrice.boxPrice}
-                    onChange={(e) => setEditingPrice({ ...editingPrice, boxPrice: e.target.value })}
-                  />
-                </div>
-                <div className="space-y-0.5">
+                <div className="space-y-0.5 col-span-2">
                   <label className="text-[9px] uppercase font-bold text-slate-400">Units/Box *</label>
                   <input
                     type="number" min="1" required
@@ -1204,12 +1262,13 @@ export default function RepDirectory({
               </div>
 
               <p className="text-[8px] text-slate-400">
-                Each field is saved exactly as entered — editing one does not recalculate another. Unit Price / Disc% are kept for reference; Box Price and Units/Box are what's actually used everywhere else. The previous values are kept in this product's edit history.
+                Box Price is calculated automatically as Unit Price × (1 − Disc%) — it's no longer a separate field to avoid it drifting out of sync. The previous values are kept in this product's edit history.
               </p>
 
               {editPreview && (
-                <div className="p-2 bg-emerald-50/60 border border-emerald-200 rounded text-[10px] text-emerald-800">
-                  <span className="font-bold">Live preview (not saved):</span> Per Unit ${editPreview.perUnit.toFixed(2)} · Per Unit (+GST) ${editPreview.perUnitGst.toFixed(2)}
+                <div className="p-2 bg-emerald-50/60 border border-emerald-200 rounded text-[10px] text-emerald-800 space-y-0.5">
+                  <div><span className="font-bold">Box Price (will be saved):</span> ${editPreview.boxPrice.toFixed(2)}</div>
+                  <div className="text-emerald-700">Per Unit ${editPreview.perUnit.toFixed(2)} · Per Unit (+GST) ${editPreview.perUnitGst.toFixed(2)}</div>
                 </div>
               )}
             </div>

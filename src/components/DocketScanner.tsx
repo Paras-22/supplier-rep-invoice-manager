@@ -56,6 +56,41 @@ const normalizeCompanyName = (name: string): string => {
     .trim();
 };
 
+// Splits a product name into "significant" words for overlap comparison —
+// drops short filler words (under 3 chars) and pure numbers/sizes (500ML,
+// 12, etc.) since those don't reliably distinguish one product from
+// another on their own and would inflate false-positive overlap scores.
+const significantWords = (name: string): string[] => {
+  return name
+    .toUpperCase()
+    .split(/[\s,/.\-()]+/)
+    .filter(w => w.length >= 3)
+    .filter(w => !/^\d+(ML|G|KG|L|GM|MG)?$/.test(w)); // drop pure sizes like 500ML, 375, 130G
+};
+
+// THE SAFETY NET. Gemini's batch matching occasionally misaligns which
+// docket line a matchedId belongs to, especially on long dockets with many
+// similarly-named products (e.g. "Chocolate Mystery Cruncher" and
+// "Raspberry Bar" sitting near each other in both the docket and the
+// candidate list) — this caused real cross-contamination between unrelated
+// products' price history. This check is a deterministic, code-level
+// verification that runs AFTER every Gemini match, regardless of what
+// confidence Gemini claims. If the candidate's actual stored name doesn't
+// share enough real word overlap with the docket line's name, the match is
+// rejected outright — it's treated as unmatched (safe: creates a new
+// product or flags for manual review) rather than silently saving a price
+// against the wrong product (unsafe: corrupts two products' history).
+const isMatchVerified = (docketName: string, candidateName: string): boolean => {
+  const docketWords = significantWords(docketName);
+  if (docketWords.length === 0) return true; // nothing meaningful to check against, don't block
+
+  const candidateWords = new Set(significantWords(candidateName));
+  const overlapCount = docketWords.filter(w => candidateWords.has(w)).length;
+  const overlapRatio = overlapCount / docketWords.length;
+
+  return overlapRatio >= 0.5;
+};
+
 export default function DocketScanner({ reps, onScanConfirmed, currentUserUid }: DocketScannerProps) {
   const [dragActive, setDragActive] = useState(false);
   const [file, setFile] = useState<File | null>(null);
@@ -272,15 +307,40 @@ Critical rules:
       });
 
       const allCandidates = Array.from(candidateMap.values());
-      setMatchingProgress(`Found ${allCandidates.length} candidates. Asking Gemini to match...`);
 
-      // ── STEP 3: ONE Gemini call to match ALL products at once ──────────
-      const matchPrompt = `You are a product matching assistant for a New Zealand supermarket.
+      // ── STEP 3: BATCHED Gemini matching ─────────────────────────────────
+      // Previously this was ONE Gemini call matching the entire docket
+      // (sometimes 30-45 lines) against the entire candidate list (often
+      // 195+ products) in a single structured-output response. On long
+      // dockets with several similarly-named products sitting near each
+      // other (e.g. "Chocolate Mystery Cruncher" and "Raspberry Bar"), this
+      // caused the model to occasionally misalign which matchedId belongs
+      // to which productIndex — silently attaching the WRONG product's
+      // price to a docket line. That's a serious bug for an app whose whole
+      // job is tracking exact costs.
+      //
+      // Fix, layer 1: split items into small batches (8 at a time) so each
+      // individual Gemini call has a short, manageable output to track,
+      // drastically reducing the chance of index misalignment. Batches run
+      // in PARALLEL via Promise.all, so total wall-clock time stays close
+      // to the original single-call approach despite more API calls.
+      const BATCH_SIZE = 8;
+      const batches: { item: any; originalIndex: number }[][] = [];
+      for (let i = 0; i < items.length; i += BATCH_SIZE) {
+        batches.push(
+          items.slice(i, i + BATCH_SIZE).map((item, j) => ({ item, originalIndex: i + j }))
+        );
+      }
+
+      setMatchingProgress(`Matching ${items.length} products in ${batches.length} batch${batches.length > 1 ? "es" : ""} of up to ${BATCH_SIZE}...`);
+
+      const batchPromises = batches.map(async (batch) => {
+        const matchPrompt = `You are a product matching assistant for a New Zealand supermarket.
 
 Match each docket product to the best database candidate IN MEMORY — no more database calls needed.
 
 Docket products to match:
-${items.map((item: any, i: number) => `${i + 1}. "${item.name}" (code: ${item.code || "none"})`).join("\n")}
+${batch.map((b, i) => `${i + 1}. "${b.item.name}" (code: ${b.item.code || "none"})`).join("\n")}
 
 Database candidates available:
 ${allCandidates.map(c => `- ID: ${c.id} | Name: ${c.name} | SKU: ${c.sku}`).join("\n")}
@@ -293,6 +353,7 @@ Matching rules:
 - If supplier code matches SKU exactly — that is a definitive match
 - If no reasonable match exists — use null
 - Do NOT force a wrong match
+- Be especially careful not to confuse different products that happen to be listed near each other — verify the brand AND product type AND size all genuinely match before accepting
 
 Return ONLY a JSON array, no markdown:
 [
@@ -300,24 +361,57 @@ Return ONLY a JSON array, no markdown:
   {"productIndex": 2, "matchedId": "barcode_id_or_null", "confidence": "high/medium/low/none"}
 ]`;
 
-      const matchRaw = await callGemini(matchPrompt);
-      let matchResults: { productIndex: number; matchedId: string | null; confidence: string }[] = [];
-      try {
-        matchResults = JSON.parse(matchRaw);
-      } catch {
-        console.error("Match parse error:", matchRaw);
-        matchResults = [];
-      }
+        const matchRaw = await callGemini(matchPrompt);
+        let batchResults: { productIndex: number; matchedId: string | null; confidence: string }[] = [];
+        try {
+          batchResults = JSON.parse(matchRaw);
+        } catch {
+          console.error("Match parse error for batch:", matchRaw);
+          batchResults = [];
+        }
 
-      // Build final items — only accept high/medium confidence matches.
+        // Map each batch-local productIndex (1-based, within this batch)
+        // back to the item's ORIGINAL position in the full docket list —
+        // this is what prevents batching itself from introducing a NEW
+        // index-mixup on reassembly.
+        return batchResults.map(r => ({
+          originalIndex: batch[r.productIndex - 1]?.originalIndex,
+          matchedId: r.matchedId,
+          confidence: r.confidence
+        })).filter(r => r.originalIndex !== undefined);
+      });
+
+      const allBatchResults = (await Promise.all(batchPromises)).flat();
+      const matchResultsByIndex = new Map(allBatchResults.map(r => [r.originalIndex, r]));
+
+      // Build final items — only accept high/medium confidence matches
+      // that ALSO pass the deterministic word-overlap verification below.
       // Box price is computed here, deterministically, from two numbers
       // Gemini extracted exactly as printed (unitPrice and discPercent) —
       // no LLM reasoning happens in this calculation, only plain arithmetic:
       // boxPrice = unitPrice × (1 − discPercent / 100)
+      let rejectedMatchCount = 0;
       const matchedItems: InvoiceItem[] = items.map((item: any, index: number) => {
-        const match = matchResults.find((r: any) => r.productIndex === index + 1);
-        const acceptMatch = match?.matchedId && match.confidence !== "low" && match.confidence !== "none";
-        const candidate = acceptMatch ? candidateMap.get(match!.matchedId!) : null;
+        const match = matchResultsByIndex.get(index);
+        const llmAcceptedMatch = !!match?.matchedId && match.confidence !== "low" && match.confidence !== "none";
+        const candidate = llmAcceptedMatch ? candidateMap.get(match!.matchedId!) : null;
+
+        // Fix, layer 2: the safety net. Even if Gemini claims a confident
+        // match, verify it deterministically using real word overlap
+        // between the docket line's name and the candidate's actual stored
+        // name. This is what catches and blocks an index-misalignment slip
+        // BEFORE it can save a price against the wrong product — the
+        // previous version had no check at all here and trusted Gemini's
+        // output completely.
+        const verified = candidate ? isMatchVerified(item.name || "", candidate.name) : false;
+        const acceptMatch = llmAcceptedMatch && verified;
+
+        if (llmAcceptedMatch && !verified) {
+          rejectedMatchCount++;
+          console.warn(
+            `Match rejected by verification: docket item "${item.name}" was matched to candidate "${candidate?.name}" (${match?.matchedId}) but failed word-overlap check. Treating as unmatched.`
+          );
+        }
 
         const rawUnitPrice = typeof item.unitPrice === "number" ? item.unitPrice : parseFloat(item.unitPrice);
         const unitPrice = !isNaN(rawUnitPrice) ? rawUnitPrice : 0;
@@ -344,9 +438,13 @@ Return ONLY a JSON array, no markdown:
           unitPrice,
           discPercent,
           matchedProductId: acceptMatch ? match!.matchedId! : "",
-          matchedProductName: candidate?.name || ""
+          matchedProductName: acceptMatch ? (candidate?.name || "") : ""
         } as any;
       });
+
+      if (rejectedMatchCount > 0) {
+        setMatchingProgress(`${rejectedMatchCount} match${rejectedMatchCount > 1 ? "es" : ""} rejected by verification — review these manually.`);
+      }
 
       // ── STEP 4: Find or create rep ─────────────────────────────────────
       const repId = await findOrCreateRep(
@@ -510,7 +608,7 @@ Return ONLY a JSON array, no markdown:
         </div>
         <div className="flex items-center gap-1 px-2 py-0.5 bg-emerald-50 rounded border border-emerald-100 text-[9px] font-bold text-emerald-800">
           <Sparkles className="h-2.5 w-2.5 animate-pulse" />
-          <span>Gemini 2.5 Flash — 2 API calls per docket</span>
+          <span>Gemini 2.5 Flash — batched matching, verified</span>
         </div>
       </div>
 
@@ -571,7 +669,7 @@ Return ONLY a JSON array, no markdown:
           <div className="text-center">
             <h3 className="text-xs font-bold text-slate-800">Matching products to database...</h3>
             <p className="text-[10px] text-slate-400 mt-0.5">{matchingProgress || "Loading candidates..."}</p>
-            <p className="text-[9px] text-slate-300 mt-1">Minimal database reads — matching in memory</p>
+            <p className="text-[9px] text-slate-300 mt-1">Batched matching with verification — accuracy over speed</p>
           </div>
         </div>
       )}
@@ -615,7 +713,7 @@ Return ONLY a JSON array, no markdown:
           )}
 
           <div className="p-2 bg-emerald-50/60 border border-emerald-200 rounded text-[10px] text-emerald-800 leading-relaxed">
-            <strong>Box Price = Unit Price × (1 − Disc%).</strong> Both numbers are extracted exactly as printed and the discount is applied automatically. Lines with a 100% discount are flagged in amber — these are usually free/promo items and the $0.00 box price should NOT be used for retail pricing decisions.
+            <strong>Box Price = Unit Price × (1 − Disc%).</strong> Both numbers are extracted exactly as printed and the discount is applied automatically. Lines with a 100% discount are flagged in amber — these are usually free/promo items and the $0.00 box price should NOT be used for retail pricing decisions. Matches are now verified by real word-overlap before being accepted — if a line shows "No match," double-check it manually rather than assuming the database lacks the product.
           </div>
 
           <div className="space-y-1.5">

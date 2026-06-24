@@ -1,5 +1,5 @@
 import { useState, useEffect, FormEvent } from "react";
-import { onAuthStateChanged, signInWithPopup, signOut, User, signInWithEmailAndPassword, createUserWithEmailAndPassword, updateProfile } from "firebase/auth";
+import { onAuthStateChanged, signInWithPopup, signOut, User, signInWithEmailAndPassword, updateProfile } from "firebase/auth";
 import { collection, onSnapshot, getDocs, doc, getDoc, setDoc, updateDoc, serverTimestamp, query, where, documentId } from "firebase/firestore";
 import { auth, db, googleProvider, testConnection, handleFirestoreError, OperationType } from "./firebase";
 import { Product, Rep, PriceEntry, Invoice, Visit } from "./types";
@@ -18,8 +18,6 @@ export default function App() {
 
   const [authEmail, setAuthEmail] = useState("");
   const [authPassword, setAuthPassword] = useState("");
-  const [authName, setAuthName] = useState("");
-  const [isSignUp, setIsSignUp] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const [authSuccess, setAuthSuccess] = useState<string | null>(null);
   const [authActionLoading, setAuthActionLoading] = useState(false);
@@ -207,6 +205,13 @@ export default function App() {
     fetchReferencedProducts();
   }, [currentUser, priceEntries]);
 
+  // Sign-in only — registration has been intentionally removed from the
+  // UI. The two staff accounts that exist were created before this change;
+  // no new accounts can be self-registered through this app anymore.
+  // Note: this removes the UI path only — it does not add server-side
+  // enforcement (Firestore Rules still allow any authenticated user
+  // through). That's a deliberate, smaller fix for now; a Firestore-Rules
+  // allowlist would be needed to fully close this off if it ever matters.
   const handleEmailAuthSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setAuthError(null);
@@ -215,60 +220,35 @@ export default function App() {
       setAuthError("Email and Password are required.");
       return;
     }
-    if (isSignUp && !authName.trim()) {
-      setAuthError("Full Name is required for registration.");
-      return;
-    }
     if (authPassword.length < 6) {
       setAuthError("Password must be at least 6 characters.");
       return;
     }
     try {
       setAuthActionLoading(true);
-      if (isSignUp) {
-        const userCredential = await createUserWithEmailAndPassword(auth, authEmail.trim(), authPassword.trim());
-        await updateProfile(userCredential.user, { displayName: authName.trim() });
-        try {
-          const userRef = doc(db, "users", userCredential.user.uid);
+      const userCredential = await signInWithEmailAndPassword(auth, authEmail.trim(), authPassword.trim());
+      try {
+        const userRef = doc(db, "users", userCredential.user.uid);
+        const userSnap = await getDoc(userRef);
+        if (!userSnap.exists()) {
           await setDoc(userRef, {
             uid: userCredential.user.uid,
-            email: authEmail.trim(),
-            displayName: authName.trim(),
+            email: userCredential.user.email || "",
+            displayName: userCredential.user.displayName || userCredential.user.email?.split("@")[0] || "Staff Member",
             createdAt: serverTimestamp(),
             lastLogin: serverTimestamp()
           });
-        } catch (dbErr) {
-          console.error("Failed to write user info:", dbErr);
+        } else {
+          await updateDoc(userRef, { lastLogin: serverTimestamp() });
         }
-        setCurrentUser({ ...userCredential.user, displayName: authName.trim(), email: authEmail.trim() } as any);
-        setAuthSuccess("Registered successfully! Welcome aboard.");
-      } else {
-        const userCredential = await signInWithEmailAndPassword(auth, authEmail.trim(), authPassword.trim());
-        try {
-          const userRef = doc(db, "users", userCredential.user.uid);
-          const userSnap = await getDoc(userRef);
-          if (!userSnap.exists()) {
-            await setDoc(userRef, {
-              uid: userCredential.user.uid,
-              email: userCredential.user.email || "",
-              displayName: userCredential.user.displayName || userCredential.user.email?.split("@")[0] || "Staff Member",
-              createdAt: serverTimestamp(),
-              lastLogin: serverTimestamp()
-            });
-          } else {
-            await updateDoc(userRef, { lastLogin: serverTimestamp() });
-          }
-        } catch (dbErr) {
-          console.error("Failed to update login details:", dbErr);
-        }
-        setCurrentUser(userCredential.user);
-        setAuthSuccess("Successfully logged in.");
+      } catch (dbErr) {
+        console.error("Failed to update login details:", dbErr);
       }
+      setCurrentUser(userCredential.user);
+      setAuthSuccess("Successfully logged in.");
     } catch (err: any) {
       let readableError = err.message || "An error occurred.";
-      if (err.code === "auth/email-already-in-use") readableError = "This email is already registered.";
-      else if (err.code === "auth/weak-password") readableError = "Password should be at least 6 characters.";
-      else if (err.code === "auth/invalid-credential" || err.code === "auth/wrong-password" || err.code === "auth/user-not-found") readableError = "Incorrect email or password.";
+      if (err.code === "auth/invalid-credential" || err.code === "auth/wrong-password" || err.code === "auth/user-not-found") readableError = "Incorrect email or password.";
       else if (err.message?.includes("CONFIGURATION_NOT_FOUND") || err.code === "auth/operation-not-allowed") readableError = "Email/Password sign-in is not enabled in Firebase Console.";
       setAuthError(readableError);
     } finally {
@@ -372,18 +352,7 @@ export default function App() {
             {authError && <div className="p-2.5 bg-rose-50 border border-rose-200 text-rose-800 text-[11px] rounded-lg leading-tight font-medium">{authError}</div>}
             {authSuccess && <div className="p-2.5 bg-emerald-50 border border-emerald-200 text-emerald-800 text-[11px] rounded-lg leading-tight font-medium">{authSuccess}</div>}
 
-            <div className="flex bg-slate-100 rounded-lg p-1">
-              <button type="button" onClick={() => { setIsSignUp(false); setAuthError(null); }} className={`flex-1 py-1 px-3 text-center text-xs font-bold rounded-md transition-all cursor-pointer ${!isSignUp ? "bg-white text-slate-800 shadow-sm" : "text-slate-500 hover:text-slate-800"}`}>Sign In</button>
-              <button type="button" onClick={() => { setIsSignUp(true); setAuthError(null); }} className={`flex-1 py-1 px-3 text-center text-xs font-bold rounded-md transition-all cursor-pointer ${isSignUp ? "bg-white text-slate-800 shadow-sm" : "text-slate-500 hover:text-slate-800"}`}>Sign Up Staff</button>
-            </div>
-
             <form onSubmit={handleEmailAuthSubmit} className="space-y-3">
-              {isSignUp && (
-                <div className="space-y-1">
-                  <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider block">Full Name</label>
-                  <input type="text" required disabled={authActionLoading} placeholder="e.g. Rachel Green" value={authName} onChange={(e) => setAuthName(e.target.value)} className="w-full text-xs p-2.5 bg-slate-50/50 border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-emerald-600 transition-all" />
-                </div>
-              )}
               <div className="space-y-1">
                 <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider block">Staff Email</label>
                 <input type="email" required disabled={authActionLoading} placeholder="name@chapeldowns.co.nz" value={authEmail} onChange={(e) => setAuthEmail(e.target.value)} className="w-full text-xs p-2.5 bg-slate-50/50 border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-emerald-600 transition-all" />
@@ -393,7 +362,7 @@ export default function App() {
                 <input type="password" required disabled={authActionLoading} placeholder="••••••••" value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} className="w-full text-xs p-2.5 bg-slate-50/50 border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-emerald-600 transition-all" />
               </div>
               <button type="submit" disabled={authActionLoading} className="w-full mt-2 py-2.5 bg-emerald-700 hover:bg-emerald-800 disabled:bg-slate-300 text-white rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 cursor-pointer shadow-md transition-all">
-                {authActionLoading ? <span className="h-4 w-4 border-2 border-white border-t-transparent animate-spin rounded-full"></span> : <span>{isSignUp ? "Register Supermarket Profile" : "Secure Staff Login"}</span>}
+                {authActionLoading ? <span className="h-4 w-4 border-2 border-white border-t-transparent animate-spin rounded-full"></span> : <span>Secure Staff Login</span>}
               </button>
             </form>
 

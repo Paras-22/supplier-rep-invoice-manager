@@ -1,5 +1,5 @@
 import React, { useState, useMemo } from "react";
-import { AlertTriangle, ShieldCheck, ArrowRight, Phone, Mail, ChevronRight, RefreshCw, ShoppingCart, SlidersHorizontal, Package, Check, Sparkles, TrendingUp, Printer, Copy } from "lucide-react";
+import { AlertTriangle, ShieldCheck, ArrowRight, Phone, Mail, ChevronRight, RefreshCw, ShoppingCart, SlidersHorizontal, Package, Check, Sparkles, TrendingUp, Printer, Copy, Star } from "lucide-react";
 import { doc, updateDoc, setDoc, collection, serverTimestamp } from "firebase/firestore";
 import { db, handleFirestoreError, OperationType } from "../firebase";
 import { Product, Rep, Order, OrderItem, PriceEntry } from "../types";
@@ -25,6 +25,41 @@ interface PriceIncreaseAlert {
   dollarChange: number;
   percentChange: number;
   effectiveDate: any;
+}
+
+// A single rep's current quote for a product, with per-unit (inc. GST)
+// already computed — this is what makes prices from different pack
+// sizes comparable.
+interface RepQuote {
+  repId: string;
+  repName: string;
+  repCompany: string;
+  boxPrice: number;
+  packQuantity: number;
+  perUnitIncGst: number;
+}
+
+// A product supplied by 2+ reps, with all their current quotes and which
+// one is cheapest.
+interface MultiSupplierProduct {
+  productId: string;
+  productName: string;
+  quotes: RepQuote[];
+  cheapestRepId: string;
+}
+
+// A product flagged because its preferred rep setup needs attention —
+// either no preferred rep is set at all, or the one that IS set isn't
+// actually the cheapest option available right now.
+interface PreferredRepIssue {
+  productId: string;
+  productName: string;
+  reason: "none-set" | "not-cheapest";
+  preferredRepName: string | null;
+  preferredRepPrice: number | null;
+  cheapestRepName: string;
+  cheapestRepPrice: number;
+  extraCostPerUnit: number | null;
 }
 
 export default function LowStockAlerts({ products, reps, priceEntries, currentUserUid, onNavigateToCatalog }: LowStockAlertsProps) {
@@ -129,6 +164,119 @@ export default function LowStockAlerts({ products, reps, priceEntries, currentUs
     return increases.sort((a, b) => b.percentChange - a.percentChange);
   }, [priceEntries, products, reps]);
 
+  // For every product, find each rep's LATEST quote and compute per-unit
+  // (inc. GST) for fair comparison across different pack sizes. Only
+  // products with 2+ distinct reps quoting them are kept — a single-
+  // supplier product has nothing to compare. This is the foundation both
+  // the Cheapest Supplier section AND the Preferred Rep Action section
+  // are built on, since they're really the same underlying data viewed
+  // two different ways.
+  const multiSupplierProducts = useMemo(() => {
+    const latestByProductRep: { [key: string]: PriceEntry } = {};
+
+    priceEntries.forEach(entry => {
+      const key = `${entry.productId}__${entry.repId}`;
+      const existing = latestByProductRep[key];
+      if (!existing) {
+        latestByProductRep[key] = entry;
+        return;
+      }
+      const existingTime = existing.effectiveDate?.seconds ? existing.effectiveDate.seconds * 1000 : new Date(existing.effectiveDate).getTime();
+      const entryTime = entry.effectiveDate?.seconds ? entry.effectiveDate.seconds * 1000 : new Date(entry.effectiveDate).getTime();
+      if (entryTime > existingTime) latestByProductRep[key] = entry;
+    });
+
+    const byProduct: { [productId: string]: RepQuote[] } = {};
+
+    Object.values(latestByProductRep).forEach(entry => {
+      const packQty = entry.packQuantity;
+      if (!packQty || packQty <= 0) return;
+      const rep = reps.find(r => r.id === entry.repId);
+      if (!rep) return;
+
+      const perUnitIncGst = (entry.price / packQty) * 1.15;
+
+      if (!byProduct[entry.productId]) byProduct[entry.productId] = [];
+      byProduct[entry.productId].push({
+        repId: entry.repId,
+        repName: rep.name,
+        repCompany: rep.company,
+        boxPrice: entry.price,
+        packQuantity: packQty,
+        perUnitIncGst
+      });
+    });
+
+    const result: MultiSupplierProduct[] = [];
+
+    Object.entries(byProduct).forEach(([productId, quotes]) => {
+      if (quotes.length < 2) return;
+      const product = products.find(p => p.id === productId);
+      if (!product) return;
+
+      const sortedQuotes = [...quotes].sort((a, b) => a.perUnitIncGst - b.perUnitIncGst);
+      const cheapestRepId = sortedQuotes[0].repId;
+
+      result.push({
+        productId,
+        productName: product.name,
+        quotes: sortedQuotes,
+        cheapestRepId
+      });
+    });
+
+    return result.sort((a, b) => a.productName.localeCompare(b.productName));
+  }, [priceEntries, products, reps]);
+
+  // Cross-references multiSupplierProducts against each product's
+  // preferredRepId. Flags two distinct situations under one combined list,
+  // with the reason shown per row: either no preferred rep has been set at
+  // all, or one IS set but a cheaper option now exists and hasn't been
+  // switched to.
+  const preferredRepIssues = useMemo(() => {
+    const issues: PreferredRepIssue[] = [];
+
+    multiSupplierProducts.forEach(msp => {
+      const product = products.find(p => p.id === msp.productId);
+      if (!product) return;
+
+      const cheapestQuote = msp.quotes.find(q => q.repId === msp.cheapestRepId)!;
+
+      if (!product.preferredRepId) {
+        issues.push({
+          productId: msp.productId,
+          productName: msp.productName,
+          reason: "none-set",
+          preferredRepName: null,
+          preferredRepPrice: null,
+          cheapestRepName: `${cheapestQuote.repName} (${cheapestQuote.repCompany})`,
+          cheapestRepPrice: cheapestQuote.perUnitIncGst,
+          extraCostPerUnit: null
+        });
+        return;
+      }
+
+      if (product.preferredRepId !== msp.cheapestRepId) {
+        const preferredQuote = msp.quotes.find(q => q.repId === product.preferredRepId);
+        if (preferredQuote) {
+          issues.push({
+            productId: msp.productId,
+            productName: msp.productName,
+            reason: "not-cheapest",
+            preferredRepName: `${preferredQuote.repName} (${preferredQuote.repCompany})`,
+            preferredRepPrice: preferredQuote.perUnitIncGst,
+            cheapestRepName: `${cheapestQuote.repName} (${cheapestQuote.repCompany})`,
+            cheapestRepPrice: cheapestQuote.perUnitIncGst,
+            extraCostPerUnit: preferredQuote.perUnitIncGst - cheapestQuote.perUnitIncGst
+          });
+        }
+      }
+    });
+
+    // Biggest overpay first, then "none set" issues after.
+    return issues.sort((a, b) => (b.extraCostPerUnit ?? 0) - (a.extraCostPerUnit ?? 0));
+  }, [multiSupplierProducts, products]);
+
   // Builds the same Product / Old / New / Rep / % info as the on-screen
   // table into a plain-text block, and copies it to the clipboard — same
   // pattern as the purchase-order copy button in RepDirectory.
@@ -194,6 +342,24 @@ export default function LowStockAlerts({ products, reps, priceEntries, currentUs
     }
   };
 
+  // Sets a product's preferredRepId directly — used by the "Switch to
+  // cheapest" quick-action button in the Preferred Rep Action section.
+  const handleSetPreferredRep = async (productId: string, repId: string) => {
+    setActionInProgressId(productId);
+    try {
+      await updateDoc(doc(db, "products", productId), {
+        preferredRepId: repId,
+        updatedAt: serverTimestamp()
+      });
+      setSuccessMessage(`Preferred supplier updated!`);
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `products/${productId}`);
+    } finally {
+      setActionInProgressId(null);
+    }
+  };
+
   // Automated draft order dispatch
   const handleCreateDraftOrder = async (product: Product, quantity: number) => {
     if (!product.preferredRepId) {
@@ -241,7 +407,13 @@ export default function LowStockAlerts({ products, reps, priceEntries, currentUs
   };
 
   return (
-    <div className="space-y-4" id="alerts_root">
+    <div className="space-y-4" id="business_insights_root">
+
+      {/* PAGE TITLE */}
+      <div className="text-left">
+        <h1 className="text-sm font-bold text-slate-900">Business Insights</h1>
+        <p className="text-[10px] text-slate-400 mt-0.5">Stock urgency, price trends, and supplier comparison — everything that needs a decision, in one place.</p>
+      </div>
       
       {/* ALERTS METRIC SUMMARY */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-3" id="alerts_summary_panel">
@@ -405,6 +577,134 @@ export default function LowStockAlerts({ products, reps, priceEntries, currentUs
                       <span className="font-bold text-[9px] text-rose-700 bg-rose-50 border border-rose-200 px-1.5 py-0.5 rounded">
                         +${inc.dollarChange.toFixed(2)} (+{inc.percentChange.toFixed(1)}%)
                       </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* CHEAPEST SUPPLIER COMPARISON */}
+      <div className="bg-white rounded border border-slate-200 overflow-hidden" id="cheapest_supplier_panel">
+        <div className="p-3 bg-emerald-50 border-b border-emerald-200">
+          <h3 className="text-[11px] font-bold text-emerald-900 flex items-center gap-1">
+            <Star className="h-3.5 w-3.5" />
+            Cheapest Supplier Comparison
+          </h3>
+          <p className="text-[9px] text-emerald-700">Every product quoted by more than one rep, compared by per-unit cost (incl. GST) so different pack sizes are comparable. Cheapest rep marked.</p>
+        </div>
+
+        {multiSupplierProducts.length === 0 ? (
+          <div className="p-8 text-center flex flex-col items-center justify-center">
+            <p className="text-[10px] text-slate-400 max-w-sm leading-normal">
+              No products are currently quoted by more than one rep — nothing to compare yet.
+            </p>
+          </div>
+        ) : (
+          <div className="overflow-x-auto max-h-96 overflow-y-auto">
+            <table className="w-full text-left text-[10px] font-sans">
+              <thead className="sticky top-0 z-10">
+                <tr className="bg-slate-50 border-b border-slate-200 text-slate-500 uppercase font-bold text-[8px] tracking-wider leading-none">
+                  <th className="p-2 px-3">Product</th>
+                  <th className="p-2 px-3">Supplier Quotes (Per Unit, incl. GST)</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {multiSupplierProducts.map(msp => (
+                  <tr key={msp.productId} className="hover:bg-emerald-50/20 align-top">
+                    <td className="p-2 px-3 min-w-[140px]">
+                      <p className="font-bold text-slate-800">{msp.productName}</p>
+                      <p className="text-[8px] text-slate-400 font-mono">{msp.productId}</p>
+                    </td>
+                    <td className="p-2 px-3">
+                      <div className="flex flex-wrap gap-1.5">
+                        {msp.quotes.map(q => {
+                          const isCheapest = q.repId === msp.cheapestRepId;
+                          return (
+                            <span
+                              key={q.repId}
+                              className={`px-1.5 py-1 rounded border text-[9px] flex items-center gap-1 ${isCheapest ? "bg-emerald-50 border-emerald-300 text-emerald-800 font-bold" : "bg-slate-50 border-slate-200 text-slate-600"}`}
+                            >
+                              {isCheapest && <Star className="h-2.5 w-2.5 fill-emerald-500 text-emerald-500" />}
+                              <span>{q.repName} ({q.repCompany})</span>
+                              <span className="font-mono">${q.perUnitIncGst.toFixed(2)}</span>
+                            </span>
+                          );
+                        })}
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* PREFERRED REP ACTION NEEDED */}
+      <div className="bg-white rounded border border-slate-200 overflow-hidden" id="preferred_rep_action_panel">
+        <div className="p-3 bg-indigo-50 border-b border-indigo-200">
+          <h3 className="text-[11px] font-bold text-indigo-900 flex items-center gap-1">
+            <ArrowRight className="h-3.5 w-3.5" />
+            Preferred Rep — Action Needed
+          </h3>
+          <p className="text-[9px] text-indigo-700">Multi-supplier products that either have no preferred rep set, or whose preferred rep isn't currently the cheapest available.</p>
+        </div>
+
+        {preferredRepIssues.length === 0 ? (
+          <div className="p-8 text-center flex flex-col items-center justify-center">
+            <div className="bg-emerald-50 rounded-full p-2.5 text-emerald-600 mb-2">
+              <ShieldCheck className="h-5 w-5 stroke-[2px]" />
+            </div>
+            <h3 className="text-xs font-bold text-slate-800">All preferred reps are optimal</h3>
+            <p className="text-[10px] text-slate-400 mt-0.5 max-w-sm leading-normal">
+              Every multi-supplier product has a preferred rep set, and it's currently the cheapest option.
+            </p>
+          </div>
+        ) : (
+          <div className="overflow-x-auto max-h-96 overflow-y-auto">
+            <table className="w-full text-left text-[10px] font-sans">
+              <thead className="sticky top-0 z-10">
+                <tr className="bg-slate-50 border-b border-slate-200 text-slate-500 uppercase font-bold text-[8px] tracking-wider leading-none">
+                  <th className="p-2 px-3">Product</th>
+                  <th className="p-2 px-3">Issue</th>
+                  <th className="p-2 px-3 text-right">Extra Cost / Unit</th>
+                  <th className="p-2 px-3 text-right">Action</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {preferredRepIssues.map(issue => (
+                  <tr key={issue.productId} className="hover:bg-indigo-50/20">
+                    <td className="p-2 px-3 min-w-[140px]">
+                      <p className="font-bold text-slate-800">{issue.productName}</p>
+                    </td>
+                    <td className="p-2 px-3">
+                      {issue.reason === "none-set" ? (
+                        <span className="text-[9px] text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded font-bold">No preferred rep set</span>
+                      ) : (
+                        <div className="space-y-0.5">
+                          <span className="text-[9px] text-rose-700 bg-rose-50 border border-rose-200 px-1.5 py-0.5 rounded font-bold">Not cheapest</span>
+                          <p className="text-[8px] text-slate-500">Currently: {issue.preferredRepName} (${issue.preferredRepPrice?.toFixed(2)}/unit)</p>
+                        </div>
+                      )}
+                      <p className="text-[8px] text-emerald-700 mt-0.5">Cheapest: {issue.cheapestRepName} (${issue.cheapestRepPrice.toFixed(2)}/unit)</p>
+                    </td>
+                    <td className="p-2 px-3 text-right font-mono font-bold text-rose-700">
+                      {issue.extraCostPerUnit !== null ? `+$${issue.extraCostPerUnit.toFixed(2)}` : "—"}
+                    </td>
+                    <td className="p-2 px-3 text-right">
+                      <button
+                        onClick={() => {
+                          const msp = multiSupplierProducts.find(m => m.productId === issue.productId);
+                          if (msp) handleSetPreferredRep(issue.productId, msp.cheapestRepId);
+                        }}
+                        disabled={actionInProgressId === issue.productId}
+                        className="px-1.5 py-1 bg-emerald-700 hover:bg-emerald-800 text-white rounded text-[9px] font-bold cursor-pointer disabled:opacity-50"
+                      >
+                        Switch to cheapest
+                      </button>
                     </td>
                   </tr>
                 ))}

@@ -195,8 +195,16 @@ export default function RepDirectory({
   // editHistory so the per-row edit/delete buttons and the audit-trail
   // expand row know exactly which Firestore doc to touch and what past
   // corrections (if any) to display.
+  //
+  // previousPackQuantity is the SECOND-most-recent entry's OWN Units/Box —
+  // deliberately NOT the current entry's Units/Box. If a supplier ever
+  // changes case-pack size between scans (it has happened — different
+  // reps use different pack conventions), using today's pack size to
+  // divide yesterday's box price would silently produce a wrong "old"
+  // per-unit figure. Each entry's per-unit math always uses its own
+  // pack size at the time it was recorded.
   const productPriceData = useMemo(() => {
-    const data: { [productId: string]: { current: number; previous: number | null; change: number | null; changePct: number | null; packQuantity: number | null; unitPrice: number | null; discPercent: number | null; effectiveDate: any; latestEntryId: string; editHistory: PriceEditHistoryItem[] } } = {};
+    const data: { [productId: string]: { current: number; previous: number | null; previousPackQuantity: number | null; change: number | null; changePct: number | null; packQuantity: number | null; unitPrice: number | null; discPercent: number | null; effectiveDate: any; latestEntryId: string; editHistory: PriceEditHistoryItem[] } } = {};
 
     repSuppliedProductIds.forEach(productId => {
       const entries = priceEntries
@@ -211,6 +219,7 @@ export default function RepDirectory({
 
       const current = entries[0].price;
       const previous = entries.length > 1 ? entries[1].price : null;
+      const previousPackQuantity = entries.length > 1 ? (entries[1].packQuantity ?? null) : null;
       const change = previous !== null ? current - previous : null;
       const changePct = previous !== null && previous > 0 ? ((current - previous) / previous) * 100 : null;
       const packQuantity = entries[0].packQuantity ?? null;
@@ -220,7 +229,7 @@ export default function RepDirectory({
       const latestEntryId = entries[0].id;
       const editHistory: PriceEditHistoryItem[] = (entries[0] as any).editHistory ?? [];
 
-      data[productId] = { current, previous, change, changePct, packQuantity, unitPrice, discPercent, effectiveDate, latestEntryId, editHistory };
+      data[productId] = { current, previous, previousPackQuantity, change, changePct, packQuantity, unitPrice, discPercent, effectiveDate, latestEntryId, editHistory };
     });
 
     return data;
@@ -645,11 +654,11 @@ export default function RepDirectory({
     );
   };
 
-  // Live preview of Box Price / Per Unit / Per Unit (+GST) inside the edit
-  // modal, computed from whatever Unit Price, Disc%, and Units/Box the form
-  // currently holds. Box Price is no longer a separate input — this IS the
-  // value that gets saved on submit, shown here so the manager can see it
-  // before confirming.
+  // Live preview of Box Price / Per Unit / Per Unit (inc. GST) inside the
+  // edit modal, computed from whatever Unit Price, Disc%, and Units/Box the
+  // form currently holds. Box Price is no longer a separate input — this IS
+  // the value that gets saved on submit, shown here so the manager can see
+  // it before confirming.
   const editPreview = useMemo(() => {
     if (!editingPrice) return null;
     const unitPrice = parseFloat(editingPrice.unitPrice);
@@ -880,7 +889,7 @@ export default function RepDirectory({
                   ) : (
                     <>
                     <p className="text-[9px] text-slate-400 pl-1">
-                      "Box Price" and "Per Unit" are wholesale, <strong>excluding GST</strong>. "Per Unit (+GST)" includes the 15% GST applied on top. Click the calculator icon to see the docket calculation and any past corrections. Click the pencil icon to fix any field.
+                      "Box Price" and "Per Unit" are wholesale, <strong>excluding GST</strong>. "Per Unit (inc. GST)" includes the 15% GST applied on top. "Previous" shows the prior box price plus its own per-unit (inc. GST) figure, since pack size can differ between scans. Click the calculator icon to see the docket calculation and any past corrections. Click the pencil icon to fix any field.
                     </p>
                     <div className="overflow-x-auto border border-slate-200 rounded max-h-80 overflow-y-auto">
                       <table className="w-full text-left text-[10px]">
@@ -890,7 +899,7 @@ export default function RepDirectory({
                             <th className="p-1.5 px-2 text-right">Box Price</th>
                             <th className="p-1.5 px-2 text-center">Units/Box</th>
                             <th className="p-1.5 px-2 text-right">Per Unit</th>
-                            <th className="p-1.5 px-2 text-right">Per Unit (+GST)</th>
+                            <th className="p-1.5 px-2 text-right">Per Unit (inc. GST)</th>
                             <th className="p-1.5 px-2 text-right">Previous</th>
                             <th className="p-1.5 px-2 text-center">Change</th>
                             <th className="p-1.5 px-2 text-center">Status</th>
@@ -907,11 +916,19 @@ export default function RepDirectory({
                             const canExpand = hasAuditTrail || hasEditHistory;
                             const isFreePromo = (pd?.discPercent ?? 0) >= 100;
                             const isConfirmingDelete = pd?.latestEntryId && confirmDeletePriceId === pd.latestEntryId;
+                            // Previous entry's own per-unit (inc. GST) — uses
+                            // that entry's OWN pack quantity, not today's, so
+                            // a pack-size change between scans doesn't distort
+                            // the historical comparison.
+                            const previousPerUnitIncGst = (pd?.previous && pd?.previousPackQuantity)
+                              ? (pd.previous / pd.previousPackQuantity) * 1.15
+                              : null;
                             return (
                               <React.Fragment key={p.id}>
                                 <tr className="hover:bg-slate-50/50">
-                                  <td className="p-1.5 px-2">
-                                    <p className="font-semibold text-slate-800 line-clamp-1">{p.name}</p>
+                                  
+                                  <td className="p-1.5 px-2 min-w-[140px]">
+                                    <p className="font-semibold text-slate-800">{p.name}</p>
                                     <p className="text-[8px] text-slate-400 font-mono">{p.id}</p>
                                   </td>
                                   <td className="p-1.5 px-2 text-right font-bold font-mono text-slate-800">
@@ -942,7 +959,16 @@ export default function RepDirectory({
                                       : "—"}
                                   </td>
                                   <td className="p-1.5 px-2 text-right font-mono text-slate-400">
-                                    {pd?.previous ? `$${pd.previous.toFixed(2)}` : "—"}
+                                    {pd?.previous ? (
+                                      <>
+                                        <div>${pd.previous.toFixed(2)}</div>
+                                        {previousPerUnitIncGst !== null && (
+                                          <div className="text-[8px] text-slate-400">
+                                            ${previousPerUnitIncGst.toFixed(2)}/unit inc. GST
+                                          </div>
+                                        )}
+                                      </>
+                                    ) : "—"}
                                   </td>
                                   <td className="p-1.5 px-2 text-center">
                                     <div className="flex items-center justify-center gap-1">
@@ -1268,7 +1294,7 @@ export default function RepDirectory({
               {editPreview && (
                 <div className="p-2 bg-emerald-50/60 border border-emerald-200 rounded text-[10px] text-emerald-800 space-y-0.5">
                   <div><span className="font-bold">Box Price (will be saved):</span> ${editPreview.boxPrice.toFixed(2)}</div>
-                  <div className="text-emerald-700">Per Unit ${editPreview.perUnit.toFixed(2)} · Per Unit (+GST) ${editPreview.perUnitGst.toFixed(2)}</div>
+                  <div className="text-emerald-700">Per Unit ${editPreview.perUnit.toFixed(2)} · Per Unit (inc. GST) ${editPreview.perUnitGst.toFixed(2)}</div>
                 </div>
               )}
             </div>

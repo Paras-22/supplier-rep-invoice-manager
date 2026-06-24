@@ -471,7 +471,7 @@ export default function App() {
             className={`px-3 py-1.5 rounded text-[11px] font-semibold shrink-0 cursor-pointer flex items-center gap-1.5 transition-all ${activeTab === "alerts" ? "bg-rose-700 text-white" : "text-slate-300 hover:bg-slate-800/80 hover:text-white"}`}
           >
             <AlertTriangle className={`h-3.5 w-3.5 ${lowStockCount > 0 ? "animate-pulse text-rose-400" : ""}`} />
-            <span>Low Stock Alerts</span>
+            <span>Business Insights</span>
             {lowStockCount > 0 && <span className="px-1.5 bg-rose-600 rounded-full text-white text-[9px] font-bold">{lowStockCount}</span>}
           </button>
         </div>
@@ -520,7 +520,15 @@ export default function App() {
               />
             )}
             {activeTab === "pos-import" && <POSImport onImportComplete={() => setActiveTab("catalog")} existingProductIds={products.map(p => p.id)} />}
-            {activeTab === "alerts" && <LowStockAlerts products={lowStockProducts} reps={reps} priceEntries={priceEntries} currentUserUid={currentUser.uid} onNavigateToCatalog={() => setActiveTab("catalog")} />}
+            {activeTab === "alerts" && (
+              <LowStockAlerts
+                products={products}
+                reps={reps}
+                priceEntries={priceEntries}
+                currentUserUid={currentUser.uid}
+                onNavigateToCatalog={() => setActiveTab("catalog")}
+              />
+            )}
           </motion.div>
         </AnimatePresence>
       </main>

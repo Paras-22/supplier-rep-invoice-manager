@@ -7,6 +7,18 @@ export interface Product {
   minStockLevel?: number;
   currentStock?: number;
   preferredRepId?: string | null;
+  // Pricing data imported from POS export (products_pricing.csv) — patched
+  // onto existing product docs by barcode, never overwrites stock levels
+  // or preferred rep. costPrice/sellingPrice/margin are dollar amounts;
+  // gpPercent/markupPercent are plain numbers (e.g. 28.47 means 28.47%).
+  // pricingFlag is "LOSS_OR_BREAKEVEN" when cost >= sellingPrice, else
+  // undefined/empty — surfaced as a warning in the UI rather than hidden.
+  costPrice?: number;
+  sellingPrice?: number;
+  margin?: number;
+  gpPercent?: number;
+  markupPercent?: number;
+  pricingFlag?: string;
   createdAt: any;
   updatedAt: any;
 }

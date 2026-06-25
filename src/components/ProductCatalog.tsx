@@ -1,6 +1,6 @@
 import React, { useEffect, useRef } from "react";
-import { Search, Star, AlertTriangle, History, Landmark, PlusCircle, Bookmark, CheckCircle, Package } from "lucide-react";
-import { collection, doc, setDoc, updateDoc, serverTimestamp, query, where, getDocs, limit } from "firebase/firestore";
+import { Search, Star, AlertTriangle, AlertCircle, History, Landmark, PlusCircle, Bookmark, CheckCircle, Package, DollarSign, AlertOctagon, Edit2, Save, X, Trash2, Loader2 } from "lucide-react";
+import { collection, doc, setDoc, updateDoc, deleteDoc, serverTimestamp, query, where, getDocs, limit, writeBatch } from "firebase/firestore";
 import { db, handleFirestoreError, OperationType } from "../firebase";
 import { Product, Rep, PriceEntry } from "../types";
 import { motion } from "motion/react";
@@ -40,6 +40,26 @@ export default function ProductCatalog({
   const [currentStockInput, setCurrentStockInput] = useState<string>("");
   const [minStockInput, setMinStockInput] = useState<string>("");
   const [stockSuccess, setStockSuccess] = useState(false);
+
+  // Inline pricing-edit state. isEditingPricing toggles the Cost/Selling
+  // boxes into editable inputs; the draft values live here until Save is
+  // pressed, so cancelling never partially-commits a half-typed edit.
+  const [isEditingPricing, setIsEditingPricing] = useState(false);
+  const [pricingCostInput, setPricingCostInput] = useState("");
+  const [pricingSellingInput, setPricingSellingInput] = useState("");
+  const [isSavingPricing, setIsSavingPricing] = useState(false);
+  const [pricingSaveSuccess, setPricingSaveSuccess] = useState(false);
+
+  // Delete-product state. showDeleteConfirm opens the confirm panel;
+  // acknowledgeCascade must be explicitly checked when the product HAS
+  // price history before the delete button activates — this mirrors the
+  // same "type to confirm" discipline RepDirectory uses for deleting a
+  // rep, just expressed as a checkbox here since the stakes (one
+  // product's history, not a rep's whole relationship) are slightly lower.
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [acknowledgeCascade, setAcknowledgeCascade] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   // Reference to the product detail panel container. When a product is
   // tapped on mobile, the scroll position otherwise stays exactly where it
@@ -91,6 +111,10 @@ export default function ProductCatalog({
   // actually update and render before we try to scroll to its container.
   const handleSelectProduct = (productId: string) => {
     setSelectedProductId(productId);
+    setIsEditingPricing(false);
+    setShowDeleteConfirm(false);
+    setAcknowledgeCascade(false);
+    setDeleteError(null);
     setTimeout(() => {
       productDetailRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
     }, 50);
@@ -106,6 +130,17 @@ export default function ProductCatalog({
         return timeB - timeA;
       });
   }, [priceEntries, selectedProductId]);
+
+  // Distinct reps that have ever quoted this product — used only in the
+  // delete-confirmation copy, so the warning names WHO would lose history,
+  // not just a bare count.
+  const productPriceRepNames = useMemo(() => {
+    const repIds = new Set(productPriceHistory.map(p => p.repId));
+    return Array.from(repIds)
+      .map(id => reps.find(r => r.id === id))
+      .filter((r): r is Rep => !!r)
+      .map(r => r.name);
+  }, [productPriceHistory, reps]);
 
   const repCurrentPrices = useMemo(() => {
     if (!selectedProductId) return [];
@@ -134,6 +169,75 @@ export default function ProductCatalog({
     const packQty = (entry as any).packQuantity;
     if (packQty && packQty > 0) return entry.price / packQty;
     return null;
+  };
+
+  // True only when the product has BOTH costPrice and sellingPrice
+  // populated from the POS pricing import (POSImport.tsx's "Update
+  // Pricing & Margins" mode) — or from a manual inline edit, which writes
+  // both fields together too. Products imported before that patch was
+  // run, or any barcode that didn't match during the import, simply won't
+  // have these fields — shown as a clear "not available" state below
+  // rather than silently rendering $0.00 or NaN.
+  const hasPricingData = !!(selectedProduct?.costPrice && selectedProduct?.sellingPrice);
+
+  // Opens the inline pricing editor, pre-filled with current values (or
+  // blank if this product has no pricing data yet — same form doubles as
+  // "add pricing for the first time").
+  const handleStartEditPricing = () => {
+    setPricingCostInput(selectedProduct?.costPrice != null ? selectedProduct.costPrice.toString() : "");
+    setPricingSellingInput(selectedProduct?.sellingPrice != null ? selectedProduct.sellingPrice.toString() : "");
+    setIsEditingPricing(true);
+    setPricingSaveSuccess(false);
+  };
+
+  // Live preview of Margin/GP%/Markup% computed from whatever is currently
+  // typed in the edit inputs — same arithmetic the POS pricing importer
+  // uses, kept here so a manual edit can never drift out of sync with how
+  // bulk-imported pricing is calculated.
+  const pricingEditPreview = useMemo(() => {
+    const cost = parseFloat(pricingCostInput);
+    const selling = parseFloat(pricingSellingInput);
+    if (isNaN(cost) || isNaN(selling) || cost <= 0 || selling <= 0) return null;
+    const margin = Math.round((selling - cost) * 100) / 100;
+    const gpPercent = Math.round(((selling - cost) / selling) * 10000) / 100;
+    const markupPercent = Math.round(((selling - cost) / cost) * 10000) / 100;
+    const pricingFlag = cost >= selling ? "LOSS_OR_BREAKEVEN" : "";
+    return { cost, selling, margin, gpPercent, markupPercent, pricingFlag };
+  }, [pricingCostInput, pricingSellingInput]);
+
+  // Saves Cost Price / Selling Price and recomputes Margin/GP%/Markup%/
+  // pricingFlag together, in code — never trusting stale values from
+  // before the edit. This mirrors exactly what POSImport.tsx's pricing
+  // patch writes, so a manual edit here and a bulk CSV re-import later
+  // never disagree about how these numbers are derived.
+  const handleSavePricing = async () => {
+    if (!selectedProduct || !pricingEditPreview) return;
+    setIsSavingPricing(true);
+    try {
+      const docRef = doc(db, "products", selectedProduct.id);
+      const { cost, selling, margin, gpPercent, markupPercent, pricingFlag } = pricingEditPreview;
+      await updateDoc(docRef, {
+        costPrice: cost,
+        sellingPrice: selling,
+        margin,
+        gpPercent,
+        markupPercent,
+        pricingFlag: pricingFlag || null,
+        updatedAt: serverTimestamp()
+      });
+      setSearchResults(searchResults.map(p =>
+        p.id === selectedProduct.id
+          ? { ...p, costPrice: cost, sellingPrice: selling, margin, gpPercent, markupPercent, pricingFlag: pricingFlag || undefined }
+          : p
+      ));
+      setIsEditingPricing(false);
+      setPricingSaveSuccess(true);
+      setTimeout(() => setPricingSaveSuccess(false), 3000);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `products/${selectedProduct.id}`);
+    } finally {
+      setIsSavingPricing(false);
+    }
   };
 
   const handleToggleLowStock = async () => {
@@ -222,6 +326,42 @@ export default function ProductCatalog({
     }
   };
 
+  // Deletes the product. If it has price history, ALSO cascade-deletes
+  // those price entries — but only once acknowledgeCascade has been
+  // explicitly checked (enforced by the disabled state on the confirm
+  // button below, not just a UI suggestion). Mirrors RepDirectory's
+  // handleDeleteRep: batch-delete the dependent price entries first, then
+  // delete the product document itself. If the product has NO price
+  // history, this is just a single clean delete — no batch needed.
+  const handleDeleteProduct = async () => {
+    if (!selectedProduct) return;
+    setIsDeleting(true);
+    setDeleteError(null);
+    try {
+      if (productPriceHistory.length > 0) {
+        const BATCH_SIZE = 500;
+        for (let i = 0; i < productPriceHistory.length; i += BATCH_SIZE) {
+          const batch = writeBatch(db);
+          const chunk = productPriceHistory.slice(i, i + BATCH_SIZE);
+          chunk.forEach(entry => batch.delete(doc(db, "prices", entry.id)));
+          await batch.commit();
+        }
+      }
+
+      await deleteDoc(doc(db, "products", selectedProduct.id));
+
+      setSearchResults(searchResults.filter(p => p.id !== selectedProduct.id));
+      setSelectedProductId("");
+      setShowDeleteConfirm(false);
+      setAcknowledgeCascade(false);
+    } catch (err: any) {
+      console.error("Delete product error:", err);
+      setDeleteError(err.message || "Failed to delete product. Please try again.");
+    } finally {
+      setIsDeleting(false);
+    }
+  };
+
   return (
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-3">
       <div className="lg:col-span-4 bg-white rounded-md shadow-sm border border-slate-200 p-3 flex flex-col h-[550px]">
@@ -289,17 +429,227 @@ export default function ProductCatalog({
                 <h1 className="text-base font-bold text-slate-900 mt-1 leading-snug">{selectedProduct.name}</h1>
                 <p className="text-[10px] font-mono text-slate-400 mt-0.5">POS SKU Barcode: {selectedProduct.id}</p>
               </div>
-              <button
-                onClick={handleToggleLowStock}
-                className={`px-2 py-1 text-[10px] font-semibold rounded flex items-center gap-1.5 cursor-pointer transition-all ${
-                  selectedProduct.lowStock
-                    ? "bg-amber-100 text-amber-900 border border-amber-200"
-                    : "bg-slate-100 border border-slate-200 text-slate-700 hover:bg-slate-200"
-                }`}
-              >
-                <AlertTriangle className="h-3.5 w-3.5" />
-                <span>{selectedProduct.lowStock ? "Low Stock: Active" : "Flag Low Stock"}</span>
-              </button>
+              <div className="flex items-center gap-1.5">
+                <button
+                  onClick={handleToggleLowStock}
+                  className={`px-2 py-1 text-[10px] font-semibold rounded flex items-center gap-1.5 cursor-pointer transition-all ${
+                    selectedProduct.lowStock
+                      ? "bg-amber-100 text-amber-900 border border-amber-200"
+                      : "bg-slate-100 border border-slate-200 text-slate-700 hover:bg-slate-200"
+                  }`}
+                >
+                  <AlertTriangle className="h-3.5 w-3.5" />
+                  <span>{selectedProduct.lowStock ? "Low Stock: Active" : "Flag Low Stock"}</span>
+                </button>
+                <button
+                  onClick={() => { setShowDeleteConfirm(true); setDeleteError(null); setAcknowledgeCascade(false); }}
+                  className="px-2 py-1 bg-rose-50 hover:bg-rose-100 border border-rose-200 text-rose-700 text-[10px] font-semibold rounded flex items-center gap-1.5 cursor-pointer transition-all"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                  <span>Delete</span>
+                </button>
+              </div>
+            </div>
+
+            {/* DELETE CONFIRMATION — behavior branches on whether this
+                product has any price history. No history: simple confirm.
+                Has history: explicit cascade acknowledgment required
+                before the delete button enables, same discipline
+                RepDirectory uses for deleting a rep. */}
+            {showDeleteConfirm && (
+              <div className="p-3 bg-rose-50 border border-rose-200 rounded space-y-2.5">
+                {productPriceHistory.length === 0 ? (
+                  <>
+                    <p className="text-[11px] font-bold text-rose-800">Delete "{selectedProduct.name}"?</p>
+                    <p className="text-[10px] text-rose-700">This product has no price history on file. This cannot be undone.</p>
+                  </>
+                ) : (
+                  <>
+                    <p className="text-[11px] font-bold text-rose-800">Delete "{selectedProduct.name}"?</p>
+                    <p className="text-[10px] text-rose-700">
+                      This product has <strong>{productPriceHistory.length} price {productPriceHistory.length === 1 ? "entry" : "entries"}</strong> on file
+                      {productPriceRepNames.length > 0 && <> from <strong>{productPriceRepNames.join(", ")}</strong></>}.
+                      Deleting the product will <strong>also permanently delete this price history</strong> — it cannot be recovered. This cannot be undone.
+                    </p>
+                    <label className="flex items-start gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={acknowledgeCascade}
+                        onChange={(e) => setAcknowledgeCascade(e.target.checked)}
+                        className="mt-0.5 cursor-pointer"
+                      />
+                      <span className="text-[10px] text-rose-800 font-semibold">
+                        I understand this will delete {productPriceHistory.length} price {productPriceHistory.length === 1 ? "entry" : "entries"} too.
+                      </span>
+                    </label>
+                  </>
+                )}
+
+                {deleteError && (
+                  <div className="p-2 bg-rose-100 border border-rose-300 text-rose-900 text-[10px] rounded flex items-start gap-1.5">
+                    <AlertCircle className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+                    <span>{deleteError}</span>
+                  </div>
+                )}
+
+                <div className="flex gap-2">
+                  <button
+                    onClick={handleDeleteProduct}
+                    disabled={isDeleting || (productPriceHistory.length > 0 && !acknowledgeCascade)}
+                    className="px-2.5 py-1 bg-rose-600 hover:bg-rose-700 disabled:bg-slate-300 disabled:text-slate-500 text-white text-[10px] font-bold rounded cursor-pointer flex items-center gap-1"
+                  >
+                    {isDeleting ? <Loader2 className="h-3 w-3 animate-spin" /> : <Trash2 className="h-3 w-3" />}
+                    <span>{isDeleting ? (productPriceHistory.length > 0 ? "Deleting price history..." : "Deleting...") : "Yes, Delete"}</span>
+                  </button>
+                  <button
+                    onClick={() => { setShowDeleteConfirm(false); setAcknowledgeCascade(false); setDeleteError(null); }}
+                    disabled={isDeleting}
+                    className="px-2.5 py-1 border border-slate-200 hover:bg-slate-50 text-slate-600 text-[10px] rounded cursor-pointer disabled:opacity-50"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* PRICING & MARGINS — sourced from the POS pricing import
+                (POSImport.tsx, "Update Pricing & Margins" mode) OR from a
+                manual inline edit below, which writes the exact same six
+                fields together so the two paths never disagree. */}
+            <div className="p-3 bg-slate-50 border border-slate-200 rounded space-y-2.5">
+              <div className="flex items-center gap-1.5">
+                <DollarSign className="h-4 w-4 text-emerald-600" />
+                <h3 className="text-[11px] font-bold text-slate-800">Pricing &amp; Margins</h3>
+                {!isEditingPricing && selectedProduct.pricingFlag === "LOSS_OR_BREAKEVEN" && (
+                  <span className="flex items-center gap-1 text-[8px] font-bold text-rose-700 bg-rose-50 border border-rose-200 px-1.5 py-0.5 rounded">
+                    <AlertOctagon className="h-2.5 w-2.5" />
+                    Loss / Break-even
+                  </span>
+                )}
+                {!isEditingPricing && (
+                  <button
+                    onClick={handleStartEditPricing}
+                    className="ml-auto p-1 px-2 bg-white hover:bg-slate-100 border border-slate-200 text-slate-600 rounded text-[9px] font-bold flex items-center gap-1 cursor-pointer"
+                  >
+                    <Edit2 className="h-2.5 w-2.5" />
+                    <span>{hasPricingData ? "Edit" : "Add Pricing"}</span>
+                  </button>
+                )}
+              </div>
+
+              {isEditingPricing ? (
+                <div className="space-y-2.5">
+                  <div className="grid grid-cols-2 gap-2">
+                    <div className="space-y-0.5">
+                      <label className="text-[8px] uppercase font-bold text-slate-400">Cost Price ($)</label>
+                      <input
+                        type="number" step="0.01" min="0" autoFocus
+                        className="w-full text-[12px] font-bold font-mono bg-white border border-slate-300 p-1.5 rounded focus:outline-none focus:border-emerald-500"
+                        placeholder="0.00"
+                        value={pricingCostInput}
+                        onChange={(e) => setPricingCostInput(e.target.value)}
+                      />
+                    </div>
+                    <div className="space-y-0.5">
+                      <label className="text-[8px] uppercase font-bold text-slate-400">Selling Price ($)</label>
+                      <input
+                        type="number" step="0.01" min="0"
+                        className="w-full text-[12px] font-bold font-mono bg-white border border-slate-300 p-1.5 rounded focus:outline-none focus:border-emerald-500"
+                        placeholder="0.00"
+                        value={pricingSellingInput}
+                        onChange={(e) => setPricingSellingInput(e.target.value)}
+                      />
+                    </div>
+                  </div>
+
+                  {pricingEditPreview ? (
+                    <div className={`p-2 rounded border text-[10px] ${
+                      pricingEditPreview.pricingFlag === "LOSS_OR_BREAKEVEN" ? "bg-rose-50 border-rose-200 text-rose-800" : "bg-emerald-50 border-emerald-200 text-emerald-800"
+                    }`}>
+                      <span className="font-bold">Margin ${pricingEditPreview.margin.toFixed(2)}</span>
+                      <span className="mx-1.5">·</span>
+                      <span className="font-bold">GP {pricingEditPreview.gpPercent.toFixed(1)}%</span>
+                      <span className="mx-1.5">·</span>
+                      <span>Markup {pricingEditPreview.markupPercent.toFixed(1)}%</span>
+                      {pricingEditPreview.pricingFlag === "LOSS_OR_BREAKEVEN" && (
+                        <span className="ml-1.5 font-bold">— cost ≥ selling, will be flagged</span>
+                      )}
+                    </div>
+                  ) : (
+                    <p className="text-[9px] text-slate-400 italic">Enter a valid Cost Price and Selling Price (both above $0) to see the calculated margin.</p>
+                  )}
+
+                  <div className="flex justify-end gap-2">
+                    <button
+                      onClick={() => setIsEditingPricing(false)}
+                      disabled={isSavingPricing}
+                      className="px-2.5 py-1 border border-slate-200 hover:bg-slate-50 text-slate-600 text-[10px] font-semibold rounded cursor-pointer flex items-center gap-1 disabled:opacity-50"
+                    >
+                      <X className="h-3 w-3" />
+                      <span>Cancel</span>
+                    </button>
+                    <button
+                      onClick={handleSavePricing}
+                      disabled={isSavingPricing || !pricingEditPreview}
+                      className="px-2.5 py-1 bg-emerald-700 hover:bg-emerald-800 disabled:bg-slate-200 disabled:text-slate-400 text-white text-[10px] font-bold rounded cursor-pointer flex items-center gap-1"
+                    >
+                      <Save className="h-3 w-3" />
+                      <span>{isSavingPricing ? "Saving..." : "Save"}</span>
+                    </button>
+                  </div>
+                </div>
+              ) : !hasPricingData ? (
+                <div className="py-3 text-center text-[10px] text-slate-400 italic">
+                  No retail pricing data on file for this product — click "Add Pricing" above to set it manually, or run the pricing CSV import.
+                </div>
+              ) : (
+                <>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                    <div className="bg-white border border-slate-200 rounded p-2 text-center">
+                      <p className="text-[8px] uppercase font-bold text-slate-400">Cost Price</p>
+                      <p className="text-sm font-extrabold text-slate-800 font-mono mt-0.5">${selectedProduct.costPrice!.toFixed(2)}</p>
+                    </div>
+                    <div className="bg-white border border-slate-200 rounded p-2 text-center">
+                      <p className="text-[8px] uppercase font-bold text-slate-400">Selling Price</p>
+                      <p className="text-sm font-extrabold text-slate-900 font-mono mt-0.5">${selectedProduct.sellingPrice!.toFixed(2)}</p>
+                    </div>
+                    <div className={`border rounded p-2 text-center ${
+                      selectedProduct.pricingFlag === "LOSS_OR_BREAKEVEN" ? "bg-rose-50 border-rose-200" : "bg-emerald-50 border-emerald-200"
+                    }`}>
+                      <p className="text-[8px] uppercase font-bold text-slate-400">Margin</p>
+                      <p className={`text-sm font-extrabold font-mono mt-0.5 ${
+                        selectedProduct.pricingFlag === "LOSS_OR_BREAKEVEN" ? "text-rose-700" : "text-emerald-700"
+                      }`}>
+                        ${selectedProduct.margin!.toFixed(2)}
+                      </p>
+                    </div>
+                    <div className={`border rounded p-2 text-center ${
+                      selectedProduct.pricingFlag === "LOSS_OR_BREAKEVEN" ? "bg-rose-50 border-rose-200" : "bg-emerald-50 border-emerald-200"
+                    }`}>
+                      <p className="text-[8px] uppercase font-bold text-slate-400">GP %</p>
+                      <p className={`text-sm font-extrabold font-mono mt-0.5 ${
+                        selectedProduct.pricingFlag === "LOSS_OR_BREAKEVEN" ? "text-rose-700" : "text-emerald-700"
+                      }`}>
+                        {selectedProduct.gpPercent!.toFixed(1)}%
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center justify-between pt-1 px-0.5">
+                    <span className="text-[9px] text-slate-400">
+                      Markup: <span className="font-bold text-slate-600">{selectedProduct.markupPercent!.toFixed(1)}%</span>
+                      <span className="text-slate-300 mx-1">·</span>
+                      GP% = (Selling − Cost) ÷ Selling. Markup% = (Selling − Cost) ÷ Cost.
+                    </span>
+                  </div>
+                </>
+              )}
+
+              {pricingSaveSuccess && (
+                <div className="text-[9px] text-emerald-800 font-bold bg-emerald-50 border border-emerald-200 p-1 text-center rounded">
+                  Pricing updated!
+                </div>
+              )}
             </div>
 
             <div className="p-3 bg-slate-50 border border-slate-200 rounded space-y-2.5">

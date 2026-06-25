@@ -10,6 +10,7 @@ import RepDirectory from "./components/RepDirectory";
 import LowStockAlerts from "./components/LowStockAlerts";
 import { Store, Receipt, Search, Users, ClipboardList, LogOut, Lock, Sparkles, AlertTriangle } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
+import cdsLogo from "./assets/cds-logo.png";
 
 export default function App() {
   const [currentUser, setCurrentUser] = useState<User | { uid: string; displayName: string; email: string; photoURL: string } | null>(null);
@@ -335,7 +336,9 @@ export default function App() {
               <Store className="h-3 w-3" />
               <span>Auckland, NZ</span>
             </div>
-            <Store className="h-12 w-12 mx-auto mb-3 stroke-[1.5px]" />
+            <div className="inline-flex items-center justify-center bg-white rounded-2xl p-3 shadow-lg mb-3">
+              <img src={cdsLogo} alt="Chapel Downs Supermarket" className="h-20 w-auto" />
+            </div>
             <h1 className="text-2xl font-bold font-sans tracking-tight">Chapel Downs Supermarket</h1>
             <p className="text-xs text-emerald-100 mt-1.5 font-medium">Supplier Rep &amp; Invoice Manager</p>
           </div>
@@ -398,9 +401,7 @@ export default function App() {
       <header className="bg-white border-b border-slate-200 sticky top-0 z-50 shadow-sm">
         <div className="max-w-7xl mx-auto px-3 h-11 flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <div className="bg-emerald-700 text-white p-1 rounded">
-              <Store className="h-4 w-4" />
-            </div>
+            <img src={cdsLogo} alt="CDS" className="h-10 w-auto" />
             <div className="text-left font-sans flex items-baseline gap-1.5">
               <h1 className="text-xs font-bold text-slate-900 tracking-tight leading-none">Chapel Downs Supermarket</h1>
               <span className="text-[10px] text-emerald-700 font-medium">Rep &amp; Invoice Manager</span>
@@ -418,7 +419,7 @@ export default function App() {
         </div>
       </header>
 
-      <div className="bg-[#0f172a] border-b border-emerald-950 py-0.5 sticky top-11 z-40 shadow-sm">
+      <div className="bg-[#0f172a] border-b border-emerald-950 py-2 sticky top-11 z-40 shadow-sm">
         <div className="max-w-7xl mx-auto px-3 flex overflow-x-auto space-x-1">
           {[
             { id: "scan", label: "Docket Scan Review", icon: <Receipt className="h-3.5 w-3.5" /> },

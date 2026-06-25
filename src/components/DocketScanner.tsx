@@ -1,5 +1,5 @@
-import React, { useState } from "react";
-import { FileUp, Receipt, Check, Loader2, AlertCircle, ShoppingBag, UserCheck, Plus, Sparkles, RefreshCw, Edit2, Gift, BadgePercent } from "lucide-react";
+import React, { useState, useRef } from "react";
+import { FileUp, Receipt, Check, Loader2, AlertCircle, ShoppingBag, UserCheck, Plus, Sparkles, RefreshCw, Edit2, Gift, BadgePercent, Clock } from "lucide-react";
 import { collection, doc, setDoc, updateDoc, serverTimestamp, query, where, getDocs, limit, or } from "firebase/firestore";
 import { db, handleFirestoreError, OperationType } from "../firebase";
 import { Rep, Invoice, InvoiceItem } from "../types";
@@ -22,7 +22,22 @@ const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
 // GST applied a second time downstream.
 const GST_RATE = 0.15;
 
-const callGemini = async (prompt: string, imagePart?: { mime_type: string; data: string }) => {
+// Free-tier Gemini rate limits are PER-MINUTE, not daily — a burst of
+// requests close together (e.g. a manager retrying a failed scan, or a
+// docket with many items triggering several parallel matching batches)
+// trips a 429 long before any real daily quota is hit. Since staff using
+// this app won't read error messages carefully, the fix has to happen
+// invisibly inside the API call itself: detect 429 specifically and retry
+// automatically with increasing delays, so a transient rate-limit blip
+// resolves on its own without ever reaching the screen. Only after all
+// retries are exhausted does the error surface — and at that point it's a
+// genuine sustained-load situation, not a one-off blip.
+const MAX_GEMINI_RETRIES = 3;
+const RETRY_DELAY_MS = [2000, 5000, 10000]; // backoff: 2s, 5s, 10s
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+const callGemini = async (prompt: string, imagePart?: { mime_type: string; data: string }, attempt: number = 0): Promise<string> => {
   const parts: any[] = [];
   if (imagePart) parts.push({ inline_data: imagePart });
   parts.push({ text: prompt });
@@ -38,10 +53,24 @@ const callGemini = async (prompt: string, imagePart?: { mime_type: string; data:
       })
     }
   );
+
   if (!response.ok) {
-    const err = await response.json();
+    // Rate limit (429) or transient server overload (503) — retry silently
+    // with backoff rather than failing the whole scan on the first bump.
+    // This is what makes a "retry storm" from someone mashing the button
+    // mostly invisible: the FIRST click's own internal retries usually
+    // absorb the rate limit before the person ever sees an error.
+    if ((response.status === 429 || response.status === 503) && attempt < MAX_GEMINI_RETRIES) {
+      await sleep(RETRY_DELAY_MS[attempt]);
+      return callGemini(prompt, imagePart, attempt + 1);
+    }
+    const err = await response.json().catch(() => null);
+    if (response.status === 429) {
+      throw new Error("RATE_LIMITED");
+    }
     throw new Error(err?.error?.message || "Gemini API call failed");
   }
+
   const data = await response.json();
   const raw = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
   return raw.replace(/```json|```/g, "").trim();
@@ -99,11 +128,43 @@ const isMatchVerified = (docketName: string, candidateName: string): boolean => 
   return overlapRatio >= 0.5;
 };
 
+// Given one batch of docket items, returns ONLY the candidates that could
+// plausibly match something in THIS batch — instead of the full
+// across-the-whole-docket candidate list. Previously every batch embedded
+// every candidate gathered from every item on the entire docket as input
+// text, which meant a 20-item docket split into 3 batches would resend a
+// large shared candidate list 3 times over, ballooning input tokens (and
+// therefore rate-limit pressure) for no benefit — a batch of 8 items can
+// only ever match against candidates sharing a brand-word with THOSE 8
+// items, never the other 12. Narrowing this is a pure cost reduction with
+// no change in matching behavior.
+const getRelevantCandidatesForBatch = (
+  batchItems: { item: any }[],
+  allCandidates: { id: string; name: string; sku: string }[]
+): { id: string; name: string; sku: string }[] => {
+  const batchFirstWords = new Set<string>();
+  const batchCodes = new Set<string>();
+  batchItems.forEach(({ item }) => {
+    const nameUpper = (item.name || "").toUpperCase();
+    const firstWord = nameUpper.split(" ")[0];
+    if (firstWord && firstWord.length > 2) batchFirstWords.add(firstWord);
+    if (item.code && item.code !== "null") batchCodes.add(item.code);
+  });
+
+  return allCandidates.filter(c => {
+    const nameUpper = c.name.toUpperCase();
+    const matchesWord = Array.from(batchFirstWords).some(w => nameUpper.startsWith(w));
+    const matchesCode = c.sku && batchCodes.has(c.sku);
+    return matchesWord || matchesCode;
+  });
+};
+
 export default function DocketScanner({ reps, onScanConfirmed, currentUserUid }: DocketScannerProps) {
   const [dragActive, setDragActive] = useState(false);
   const [file, setFile] = useState<File | null>(null);
-  const [status, setStatus] = useState<"idle" | "scanning" | "matching" | "review" | "saving" | "success" | "error">("idle");
+  const [status, setStatus] = useState<"idle" | "scanning" | "matching" | "review" | "saving" | "success" | "error" | "cooldown">("idle");
   const [matchingProgress, setMatchingProgress] = useState("");
+  const [cooldownSeconds, setCooldownSeconds] = useState(0);
 
   const [extractedData, setExtractedData] = useState<{
     supplierName: string;
@@ -118,6 +179,13 @@ export default function DocketScanner({ reps, onScanConfirmed, currentUserUid }:
   const [selectedRepId, setSelectedRepId] = useState<string>("");
   const [invoiceRecordId, setInvoiceRecordId] = useState<string>("");
   const [errorMessage, setErrorMessage] = useState("");
+
+  // Hard lock against double-firing a scan. status already prevents the
+  // button from being clickable once a scan starts, but this ref is an
+  // extra belt-and-suspenders guard in case of any race (e.g. a very fast
+  // double-click landing both calls before the first re-render commits).
+  const scanInFlightRef = useRef(false);
+  const cooldownIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const handleDrag = (e: React.DragEvent) => {
     e.preventDefault();
@@ -208,10 +276,37 @@ export default function DocketScanner({ reps, onScanConfirmed, currentUserUid }:
     return repRef.id;
   };
 
+  // Starts a visible countdown after a genuine rate-limit exhaustion (all
+  // internal retries failed). During this window the scan/retry buttons
+  // are disabled — not just discouraged via a message — so a staff member
+  // physically cannot mash the button into another rate-limit hit. Once
+  // the countdown reaches zero, status returns to "error" so they can
+  // retry normally (which will go through its own internal retry logic
+  // again if needed).
+  const startCooldown = (seconds: number) => {
+    setStatus("cooldown");
+    setCooldownSeconds(seconds);
+    if (cooldownIntervalRef.current) clearInterval(cooldownIntervalRef.current);
+    cooldownIntervalRef.current = setInterval(() => {
+      setCooldownSeconds(prev => {
+        if (prev <= 1) {
+          if (cooldownIntervalRef.current) clearInterval(cooldownIntervalRef.current);
+          setStatus("error");
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+  };
+
   const handleStartOCRScan = async () => {
+    // Belt-and-suspenders lock — prevents a second scan from starting while
+    // one is already in flight, even if status hasn't re-rendered yet.
+    if (scanInFlightRef.current) return;
     if (!file) { setStatus("error"); setErrorMessage("Please select a file to scan."); return; }
     if (!GEMINI_API_KEY) { setStatus("error"); setErrorMessage("Gemini API key not found. Add VITE_GEMINI_API_KEY to your .env file."); return; }
 
+    scanInFlightRef.current = true;
     setStatus("scanning");
     try {
       const { base64, mimeType } = await convertFileToBase64(file);
@@ -380,6 +475,15 @@ Critical rules:
       setMatchingProgress(`Matching ${items.length} products in ${batches.length} batch${batches.length > 1 ? "es" : ""} of up to ${BATCH_SIZE}...`);
 
       const batchPromises = batches.map(async (batch) => {
+        // Fix, cost layer: only send candidates relevant to THIS batch's
+        // items instead of the full docket-wide candidate list. Cuts input
+        // tokens substantially on dockets with several batches, which
+        // directly reduces how fast a scan can trip a per-minute rate
+        // limit — without changing which candidates a batch can match
+        // against (a batch could never validly match outside its own
+        // items' brand words anyway).
+        const relevantCandidates = getRelevantCandidatesForBatch(batch, allCandidates);
+
         const matchPrompt = `You are a product matching assistant for a New Zealand supermarket.
 
 Match each docket product to the best database candidate IN MEMORY — no more database calls needed.
@@ -388,7 +492,7 @@ Docket products to match:
 ${batch.map((b, i) => `${i + 1}. "${b.item.name}" (code: ${b.item.code || "none"})`).join("\n")}
 
 Database candidates available:
-${allCandidates.map(c => `- ID: ${c.id} | Name: ${c.name} | SKU: ${c.sku}`).join("\n")}
+${relevantCandidates.map(c => `- ID: ${c.id} | Name: ${c.name} | SKU: ${c.sku}`).join("\n")}
 
 Matching rules:
 - Match by brand + product type + size/volume + flavour
@@ -537,8 +641,20 @@ Return ONLY a JSON array, no markdown:
 
     } catch (err: any) {
       console.error("Scanning failed:", err);
-      setStatus("error");
-      setErrorMessage(err.message || "Failed to scan docket. Check your Gemini API key.");
+      // RATE_LIMITED means every internal retry in callGemini already
+      // failed — this is a genuine sustained-load situation, not a blip.
+      // Force a visible, timed cooldown instead of a plain error message,
+      // since a staff member retrying immediately would almost certainly
+      // hit the same wall again.
+      if (err.message === "RATE_LIMITED") {
+        setErrorMessage("Gemini is temporarily busy (free-tier rate limit). The app will let you retry automatically in a moment — please don't refresh.");
+        startCooldown(30);
+      } else {
+        setStatus("error");
+        setErrorMessage(err.message || "Failed to scan docket. Check your Gemini API key.");
+      }
+    } finally {
+      scanInFlightRef.current = false;
     }
   };
 
@@ -985,6 +1101,26 @@ Return ONLY a JSON array, no markdown:
             Scan Another Docket
           </button>
         </motion.div>
+      )}
+
+      {/* COOLDOWN — genuine rate-limit exhaustion. Buttons are not just
+          discouraged, the whole panel replaces the error state so there is
+          nothing clickable that could trigger another request during the
+          wait. */}
+      {status === "cooldown" && (
+        <div className="py-8 text-center space-y-3">
+          <div className="inline-flex items-center justify-center p-2 bg-amber-100 rounded-full text-amber-600">
+            <Clock className="h-6 w-6" />
+          </div>
+          <div>
+            <h3 className="text-xs font-bold text-amber-900">Gemini is busy right now</h3>
+            <p className="text-[9px] text-amber-700 max-w-xs mx-auto mt-0.5 leading-normal">{errorMessage}</p>
+          </div>
+          <div className="inline-flex items-center gap-2 px-3 py-1.5 bg-amber-50 border border-amber-200 rounded-full">
+            <Loader2 className="h-3 w-3 text-amber-600 animate-spin" />
+            <span className="text-[11px] font-bold text-amber-800 font-mono">Retry available in {cooldownSeconds}s</span>
+          </div>
+        </div>
       )}
 
       {/* ERROR */}

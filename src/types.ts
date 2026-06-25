@@ -54,6 +54,14 @@ export interface InvoiceItem {
   packQuantity?: number;
   unitPrice?: number;
   discPercent?: number;
+  // GST audit trail from DocketScanner's normalization step. gstStatus is
+  // what Gemini detected on the docket's price column ("inclusive" means
+  // the printed Unit Price already included GST and was divided by 1.15
+  // before being stored here). originalUnitPriceIncGst preserves the raw
+  // printed figure for that case, purely for the review-table badge — it
+  // is never used in any price calculation downstream.
+  gstStatus?: "inclusive" | "exclusive" | "unknown";
+  originalUnitPriceIncGst?: number | null;
   matchedProductId?: string | null;
   matchedProductName?: string | null;
 }

@@ -2,12 +2,24 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-   <title>Chapel Downs - Rep & Invoice Manager by Paras</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>Chapel Downs - Rep & Invoice Manager by Paras</title>
+
+    <!-- Cross-platform PWA manifest (Android/Chrome install experience) -->
+    <link rel="manifest" href="/manifest.json" />
+
+    <!-- iOS "Add to Home Screen" support — Android ignores these harmlessly -->
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="CDS Supplier" />
+
+    <!-- Standard favicon + browser/Android theme color -->
+    <link rel="icon" href="/icon-192.png" type="image/png" />
+    <meta name="theme-color" content="#047857" />
   </head>
   <body>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
-

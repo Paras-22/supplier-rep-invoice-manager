@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { FileUp, Receipt, Check, Loader2, AlertCircle, ShoppingBag, UserCheck, Plus, Sparkles, RefreshCw, Edit2, Gift } from "lucide-react";
+import { FileUp, Receipt, Check, Loader2, AlertCircle, ShoppingBag, UserCheck, Plus, Sparkles, RefreshCw, Edit2, Gift, BadgePercent } from "lucide-react";
 import { collection, doc, setDoc, updateDoc, serverTimestamp, query, where, getDocs, limit, or } from "firebase/firestore";
 import { db, handleFirestoreError, OperationType } from "../firebase";
 import { Rep, Invoice, InvoiceItem } from "../types";
@@ -13,6 +13,14 @@ interface DocketScannerProps {
 }
 
 const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
+
+// NZ GST rate. Used only to NORMALIZE an inc-GST printed price back down to
+// the ex-GST figure this app stores everywhere (PriceEntry.unitPrice /
+// PriceEntry.price are always ex-GST — ProductCatalog and RepDirectory both
+// multiply by 1.15 themselves when displaying "inc. GST" figures). Without
+// this normalization, a docket that already prints inc-GST prices would get
+// GST applied a second time downstream.
+const GST_RATE = 0.15;
 
 const callGemini = async (prompt: string, imagePart?: { mime_type: string; data: string }) => {
   const parts: any[] = [];
@@ -225,9 +233,10 @@ Extract and return ONLY a valid JSON object with no markdown, no explanation:
       "name": "full expanded standardised product name in UPPERCASE English",
       "code": "supplier product code if visible, otherwise null",
       "quantity": quantity ordered as whole number (number of cases/cartons, NOT individual units),
-      "unitPrice": the PRE-DISCOUNT box/case price exactly as printed in the docket's "Price" or "Unit Price" column for this line, as a decimal number. Do NOT apply any discount to this number — extract it exactly as printed,
+      "unitPrice": the PRE-DISCOUNT box/case price exactly as printed in the docket's "Price" or "Unit Price" column for this line, as a decimal number. Do NOT apply any discount to this number, and do NOT adjust it for GST yourself — extract it exactly as printed, character for character converted to a number,
       "discPercent": the discount percentage exactly as printed in the docket's "Disc%" or "Disc." column for this line, as a plain number (e.g. 13 for "13%", 100 for "100%", 0 if no discount column or blank/0% shown for this line),
-      "packQuantity": the number of individual units inside one case/carton/box for this line, as a whole number
+      "packQuantity": the number of individual units inside one case/carton/box for this line, as a whole number,
+      "gstStatus": "inclusive" if the column header or nearby label for this price explicitly says it includes GST (e.g. "Unit Price (inc-GST)", "Price incl. GST", "Inc GST"), "exclusive" if explicitly labelled as excluding GST (e.g. "Price (excl GST)", "ex-GST", "+GST" shown separately as an addition), or if there is no GST label at all anywhere on the docket near this price column (most NZ wholesale dockets quote ex-GST by default with GST added as a separate total line), "unknown" only if the docket is genuinely ambiguous or contradictory about GST treatment for this column
     }
   ]
 }
@@ -239,7 +248,8 @@ Critical rules:
 - Remove pack multipliers (x12, X24, *12, 12pk, per carton, x10/pack) from the NAME field only — but capture that exact number in "packQuantity" instead of discarding it. These multipliers can appear anywhere in the description, with x, X, or * as the separator, in brackets or not, in any position (e.g. "DRAGON COOL BANANA SPRAY (9)" → packQuantity 9, "MUSASHI ENERGY MANGO 500ML 12PK" → packQuantity 12, "KOBI SALTED PEANUTS 130GX24CTN" → packQuantity 24)
 - If no pack size number is visible anywhere for a line (e.g. loose produce, single units), set "packQuantity" to 1
 - Keep product size like 375ML, 500ML, 130G, 43G, 26G in the name
-- "unitPrice" must be the PRE-discount box/case price column exactly as printed — never the final/extended/total/amount column, and never with any discount already applied
+- "unitPrice" must be the PRE-discount box/case price column exactly as printed — never the final/extended/total/amount column, and never with any discount already applied. Return the RAW printed number regardless of gstStatus — GST adjustment is handled separately, do not do it yourself
+- "gstStatus" is determined by reading the actual column headers / labels on THIS docket, not by assumption — look for words like "inc-GST", "incl GST", "GST inclusive" (→ "inclusive") vs "excl GST", "ex-GST", "+GST" (→ "exclusive"). If you see no such label anywhere near the price columns, use "exclusive" (the NZ wholesale default), not "unknown". Only use "unknown" if there are conflicting or unreadable labels
 - "discPercent" must be the discount percentage column exactly as printed, as a plain number with no % sign (e.g. write 24, not "24%"). If the docket has no discount column at all, or shows 0% for this line, use 0
 - quantity = QTY column value as integer (number of cases/cartons ordered, not units inside)
 - repPhone and repEmail can belong to a named contact person on the docket even if that person is not explicitly labelled "rep" — use your judgement based on context (e.g. a name with a phone number and/or email near the supplier letterhead). If multiple contacts are listed, prefer the one matching repName, otherwise the first one listed
@@ -248,11 +258,46 @@ Critical rules:
       const ocrRaw = await callGemini(ocrPrompt, { mime_type: mimeType, data: base64 });
       const ocrPayload = JSON.parse(ocrRaw);
 
+      // ── STEP 1.5: GST NORMALIZATION — deterministic, code-level ────────
+      // This app stores PriceEntry.unitPrice / PriceEntry.price as EX-GST
+      // everywhere — ProductCatalog.tsx and RepDirectory.tsx both multiply
+      // by 1.15 themselves to show "inc. GST" figures. Some supplier
+      // dockets (e.g. MG International) print their "Unit Price" column as
+      // ALREADY including GST. If that raw inc-GST number flowed through
+      // unchanged, the app's own ×1.15 display logic would apply GST a
+      // SECOND time, inflating the per-unit (inc. GST) figure shown to
+      // staff. Gemini is asked to detect and report gstStatus per line
+      // above, but the actual ÷1.15 division happens here in plain
+      // arithmetic — not inside the LLM prompt — so it's deterministic and
+      // auditable rather than trusting Gemini's mental maths.
+      //
+      // originalUnitPriceIncGst is kept on the item (when normalization
+      // happened) purely so the review table can show a small "GST
+      // removed" badge — a visual check, since OCR's gstStatus read won't
+      // be 100% reliable and a misread should be easy to catch and correct
+      // in review, not silently trusted.
+      const rawItems: any[] = ocrPayload.items || [];
+      const items: any[] = rawItems.map((item: any) => {
+        const parsedRaw = typeof item.unitPrice === "number" ? item.unitPrice : parseFloat(item.unitPrice);
+        const rawUnitPrice = !isNaN(parsedRaw) ? parsedRaw : 0;
+        const gstStatus = item.gstStatus === "inclusive" ? "inclusive" : item.gstStatus === "unknown" ? "unknown" : "exclusive";
+
+        if (gstStatus === "inclusive" && rawUnitPrice > 0) {
+          const exGstUnitPrice = Math.round((rawUnitPrice / (1 + GST_RATE)) * 100) / 100;
+          return {
+            ...item,
+            unitPrice: exGstUnitPrice,
+            gstStatus,
+            originalUnitPriceIncGst: rawUnitPrice
+          };
+        }
+
+        return { ...item, unitPrice: rawUnitPrice, gstStatus };
+      });
+
       // ── STEP 2: SMART MATCHING — minimal Firestore reads ───────────────
       setStatus("matching");
       setMatchingProgress("Collecting unique search terms...");
-
-      const items: any[] = ocrPayload.items || [];
 
       // Collect all unique first words across ALL docket items — deduped
       const firstWords = new Set<string>();
@@ -387,8 +432,8 @@ Return ONLY a JSON array, no markdown:
       // Build final items — only accept high/medium confidence matches
       // that ALSO pass the deterministic word-overlap verification below.
       // Box price is computed here, deterministically, from two numbers
-      // Gemini extracted exactly as printed (unitPrice and discPercent) —
-      // no LLM reasoning happens in this calculation, only plain arithmetic:
+      // — the (already GST-normalized) unitPrice and discPercent — no LLM
+      // reasoning happens in this calculation, only plain arithmetic:
       // boxPrice = unitPrice × (1 − discPercent / 100)
       let rejectedMatchCount = 0;
       const matchedItems: InvoiceItem[] = items.map((item: any, index: number) => {
@@ -413,6 +458,8 @@ Return ONLY a JSON array, no markdown:
           );
         }
 
+        // unitPrice has already been GST-normalized (ex-GST) in Step 1.5
+        // above — this is just type coercion, no GST math happens here.
         const rawUnitPrice = typeof item.unitPrice === "number" ? item.unitPrice : parseFloat(item.unitPrice);
         const unitPrice = !isNaN(rawUnitPrice) ? rawUnitPrice : 0;
 
@@ -437,6 +484,11 @@ Return ONLY a JSON array, no markdown:
           // calculation beyond the one boxPrice computation above.
           unitPrice,
           discPercent,
+          // GST audit trail — gstStatus/originalUnitPriceIncGst are purely
+          // informational (drive the review-table badge); they are NOT
+          // used in any price calculation and are safe to ignore elsewhere.
+          gstStatus: item.gstStatus || "exclusive",
+          originalUnitPriceIncGst: item.originalUnitPriceIncGst ?? null,
           matchedProductId: acceptMatch ? match!.matchedId! : "",
           matchedProductName: acceptMatch ? (candidate?.name || "") : ""
         } as any;
@@ -596,6 +648,7 @@ Return ONLY a JSON array, no markdown:
 
   const matchedCount = extractedData?.items.filter(i => i.matchedProductId).length || 0;
   const totalCount = extractedData?.items.length || 0;
+  const gstNormalizedCount = extractedData?.items.filter(i => (i as any).originalUnitPriceIncGst != null).length || 0;
 
   return (
     <div className="bg-white rounded-md shadow-sm border border-slate-200 p-4">
@@ -712,8 +765,18 @@ Return ONLY a JSON array, no markdown:
             </div>
           )}
 
+          {/* GST normalization notice — only shown when at least one line was detected as inc-GST and adjusted */}
+          {gstNormalizedCount > 0 && (
+            <div className="flex items-start gap-2 p-2 bg-indigo-50/60 border border-indigo-200 rounded text-[10px] text-indigo-800">
+              <BadgePercent className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+              <span>
+                <strong>{gstNormalizedCount} line{gstNormalizedCount > 1 ? "s" : ""}</strong> on this docket printed prices <strong>including GST</strong> — Unit Price has been automatically divided by 1.15 so it's stored excl-GST like every other product, matching the rest of the app. Lines adjusted are marked below with a badge showing the original printed figure. Double-check these before confirming.
+              </span>
+            </div>
+          )}
+
           <div className="p-2 bg-emerald-50/60 border border-emerald-200 rounded text-[10px] text-emerald-800 leading-relaxed">
-            <strong>Box Price = Unit Price × (1 − Disc%).</strong> Both numbers are extracted exactly as printed and the discount is applied automatically. Lines with a 100% discount are flagged in amber — these are usually free/promo items and the $0.00 box price should NOT be used for retail pricing decisions. Matches are now verified by real word-overlap before being accepted — if a line shows "No match," double-check it manually rather than assuming the database lacks the product.
+            <strong>Box Price = Unit Price × (1 − Disc%).</strong> Both numbers are extracted exactly as printed (Unit Price is shown here excl-GST, after automatic GST normalization if needed) and the discount is applied automatically. Lines with a 100% discount are flagged in amber — these are usually free/promo items and the $0.00 box price should NOT be used for retail pricing decisions. Matches are now verified by real word-overlap before being accepted — if a line shows "No match," double-check it manually rather than assuming the database lacks the product.
           </div>
 
           <div className="space-y-1.5">
@@ -737,7 +800,7 @@ Return ONLY a JSON array, no markdown:
                     <th className="p-1 px-2.5">Product Name (from docket)</th>
                     <th className="p-1 px-2 w-24">Barcode / Code</th>
                     <th className="p-1 px-2 w-12 text-center">Qty</th>
-                    <th className="p-1 px-2 w-20">Unit Price ($)</th>
+                    <th className="p-1 px-2 w-20">Unit Price ($, excl. GST)</th>
                     <th className="p-1 px-2 w-16 text-center">Disc %</th>
                     <th className="p-1 px-2 w-20 text-right">Box Price ($)</th>
                     <th className="p-1 px-2 w-16 text-center">Units/Box</th>
@@ -747,6 +810,8 @@ Return ONLY a JSON array, no markdown:
                   {extractedData.items.map((item, index) => {
                     const discPercent = (item as any).discPercent ?? 0;
                     const isFreePromo = discPercent >= 100;
+                    const originalIncGst = (item as any).originalUnitPriceIncGst;
+                    const wasGstNormalized = originalIncGst != null;
                     return (
                     <tr key={index} className={`hover:bg-slate-50/50 ${item.matchedProductId ? "" : "bg-amber-50/30"} ${isFreePromo ? "bg-amber-50" : ""}`}>
 
@@ -811,7 +876,7 @@ Return ONLY a JSON array, no markdown:
                         <input type="number" className="bg-transparent border-b border-transparent hover:border-slate-300 focus:border-emerald-500 focus:outline-none p-0 text-[10px] text-slate-800 w-full text-center font-bold" value={item.quantity} onChange={(e) => handleUpdateItemField(index, "quantity", parseInt(e.target.value) || 0)} />
                       </td>
 
-                      {/* UNIT PRICE — pre-discount, editable */}
+                      {/* UNIT PRICE — pre-discount, excl-GST, editable */}
                       <td className="p-1 px-2">
                         <div className="relative">
                           <span className="absolute left-0 bottom-0 text-[9px] text-slate-400">$</span>
@@ -822,6 +887,15 @@ Return ONLY a JSON array, no markdown:
                             onChange={(e) => handleUpdateItemField(index, "unitPrice" as any, parseFloat(e.target.value) || 0)}
                           />
                         </div>
+                        {wasGstNormalized && (
+                          <span
+                            title="This docket's price column was labelled as including GST. The original printed figure was divided by 1.15 to get this excl-GST Unit Price."
+                            className="inline-flex items-center gap-0.5 mt-0.5 text-[8px] font-bold text-indigo-700 bg-indigo-100 px-1 py-0.5 rounded cursor-help"
+                          >
+                            <BadgePercent className="h-2.5 w-2.5" />
+                            GST removed (was ${originalIncGst.toFixed(2)} inc.)
+                          </span>
+                        )}
                       </td>
 
                       {/* DISC % — editable */}
@@ -858,7 +932,7 @@ Return ONLY a JSON array, no markdown:
               </table>
             </div>
             <p className="text-[9px] text-slate-400 pl-1">
-              Box Price is calculated automatically as Unit Price × (1 − Disc%). Edit Unit Price or Disc% to correct a misread, and Box Price updates live. Units/Box is extracted as printed — divide Box Price by Units/Box yourself for per-unit cost.
+              Box Price is calculated automatically as Unit Price × (1 − Disc%). Edit Unit Price or Disc% to correct a misread, and Box Price updates live. Units/Box is extracted as printed — divide Box Price by Units/Box yourself for per-unit cost. If a "GST removed" badge looks wrong (e.g. the docket was actually already excl-GST), just correct the Unit Price field directly — it's a normal editable field either way.
             </p>
           </div>
 

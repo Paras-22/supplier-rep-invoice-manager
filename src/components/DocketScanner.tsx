@@ -789,9 +789,8 @@ Return ONLY a JSON array, no markdown:
               onDragEnter={handleDrag} onDragOver={handleDrag}
               onDragLeave={handleDrag} onDrop={handleDrop}
               onClick={() => document.getElementById("docket_file_picker")?.click()}
-              className={`border-2 border-dashed rounded p-8 flex flex-col items-center justify-center cursor-pointer transition-all ${
-                dragActive ? "border-emerald-500 bg-emerald-50/30" : "border-slate-200 hover:border-emerald-400 bg-slate-50/40"
-              }`}
+              className={`border-2 border-dashed rounded p-8 flex flex-col items-center justify-center cursor-pointer transition-all ${dragActive ? "border-emerald-500 bg-emerald-50/30" : "border-slate-200 hover:border-emerald-400 bg-slate-50/40"
+                }`}
             >
               <FileUp className="h-8 w-8 text-slate-400 mb-2" />
               <p className="text-xs font-bold text-slate-700">Upload Wholesale Docket Photo or PDF</p>
@@ -909,17 +908,17 @@ Return ONLY a JSON array, no markdown:
             </div>
 
             <div className="overflow-x-auto border border-slate-200 rounded">
-              <table className="w-full text-left text-[10px]">
+              <table className="w-full text-left text-[10px]" style={{ minWidth: "900px" }}>
                 <thead>
                   <tr className="bg-slate-50 text-slate-500 font-bold uppercase text-[8px] border-b border-slate-200">
-                    <th className="p-1 px-2.5">Database Match</th>
-                    <th className="p-1 px-2.5">Product Name (from docket)</th>
-                    <th className="p-1 px-2 w-24">Barcode / Code</th>
-                    <th className="p-1 px-2 w-12 text-center">Qty</th>
-                    <th className="p-1 px-2 w-20">Unit Price ($, excl. GST)</th>
-                    <th className="p-1 px-2 w-16 text-center">Disc %</th>
-                    <th className="p-1 px-2 w-20 text-right">Box Price ($)</th>
-                    <th className="p-1 px-2 w-16 text-center">Units/Box</th>
+                    <th className="p-1 px-2.5" style={{ minWidth: "170px" }}>Database Match</th>
+                    <th className="p-1 px-2.5" style={{ minWidth: "180px" }}>Product Name (from docket)</th>
+                    <th className="p-1 px-2" style={{ minWidth: "110px" }}>Barcode / Code</th>
+                    <th className="p-1 px-2 text-center" style={{ minWidth: "50px" }}>Qty</th>
+                    <th className="p-1 px-2" style={{ minWidth: "100px" }}>Unit Price ($, excl. GST)</th>
+                    <th className="p-1 px-2 text-center" style={{ minWidth: "70px" }}>Disc %</th>
+                    <th className="p-1 px-2 text-right" style={{ minWidth: "90px" }}>Box Price ($)</th>
+                    <th className="p-1 px-2 text-center" style={{ minWidth: "80px" }}>Units/Box</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
@@ -929,121 +928,124 @@ Return ONLY a JSON array, no markdown:
                     const originalIncGst = (item as any).originalUnitPriceIncGst;
                     const wasGstNormalized = originalIncGst != null;
                     return (
-                    <tr key={index} className={`hover:bg-slate-50/50 ${item.matchedProductId ? "" : "bg-amber-50/30"} ${isFreePromo ? "bg-amber-50" : ""}`}>
+                      <tr key={index} className={`hover:bg-slate-50/50 ${item.matchedProductId ? "" : "bg-amber-50/30"} ${isFreePromo ? "bg-amber-50" : ""}`}>
 
-                      {/* DATABASE MATCH COLUMN */}
-                      <td className="p-1 px-2 min-w-[160px]">
-                        {item.matchedProductId ? (
-                          <div className="space-y-0.5">
-                            <div className="flex items-center gap-1 px-1.5 py-0.5 bg-emerald-50 text-emerald-800 rounded font-bold text-[9px] w-fit">
-                              <Check className="h-3 w-3 shrink-0" />
-                              <span className="font-mono">{item.matchedProductId}</span>
+                        {/* DATABASE MATCH COLUMN */}
+                        <td className="p-1 px-2" style={{ minWidth: "170px" }}>
+
+                          {item.matchedProductId ? (
+                            <div className="space-y-0.5">
+                              <div className="flex items-center gap-1 px-1.5 py-0.5 bg-emerald-50 text-emerald-800 rounded font-bold text-[9px] w-fit">
+                                <Check className="h-3 w-3 shrink-0" />
+                                <span className="font-mono">{item.matchedProductId}</span>
+                              </div>
+                              {(item as any).matchedProductName && (
+                                <p className="text-[8px] text-slate-500 pl-1 line-clamp-1">{(item as any).matchedProductName}</p>
+                              )}
                             </div>
-                            {(item as any).matchedProductName && (
-                              <p className="text-[8px] text-slate-500 pl-1 line-clamp-1">{(item as any).matchedProductName}</p>
-                            )}
-                          </div>
-                        ) : (
-                          <div className="space-y-1">
-                            <div className="flex items-center gap-1">
-                              <span className="text-[9px] text-amber-700 bg-amber-50 border border-amber-200 px-1 py-0.5 rounded">No match</span>
-                              <button
-                                onClick={() => handleCreateNewProduct(index)}
-                                title="Create as new product"
-                                className="p-0.5 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded cursor-pointer"
-                              >
-                                <Plus className="h-3 w-3 text-emerald-600" />
-                              </button>
+                          ) : (
+                            <div className="space-y-1">
+                              <div className="flex items-center gap-1">
+                                <span className="text-[9px] text-amber-700 bg-amber-50 border border-amber-200 px-1 py-0.5 rounded">No match</span>
+                                <button
+                                  onClick={() => handleCreateNewProduct(index)}
+                                  title="Create as new product"
+                                  className="p-0.5 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded cursor-pointer"
+                                >
+                                  <Plus className="h-3 w-3 text-emerald-600" />
+                                </button>
+                              </div>
+                              {/* Manual barcode entry */}
+                              <input
+                                type="text"
+                                placeholder="Enter barcode manually..."
+                                className="w-full text-[9px] font-mono p-0.5 border border-slate-200 rounded focus:border-emerald-500 focus:outline-none bg-white"
+                                onChange={(e) => {
+                                  if (e.target.value.length > 4) {
+                                    handleUpdateItemField(index, "matchedProductId", e.target.value);
+                                    handleUpdateItemField(index, "code", e.target.value);
+                                  }
+                                }}
+                              />
                             </div>
-                            {/* Manual barcode entry */}
+                          )}
+                        </td>
+
+                        {/* PRODUCT NAME */}
+
+                        <td className="p-1 px-2" style={{ minWidth: "180px" }}>
+                          <input type="text" className="bg-transparent border-b border-transparent hover:border-slate-300 focus:border-emerald-500 focus:outline-none p-0 text-[10px] font-bold text-slate-800 w-full" value={item.name} onChange={(e) => handleUpdateItemField(index, "name", e.target.value)} />
+                          {isFreePromo && (
+                            <span className="inline-flex items-center gap-0.5 mt-0.5 text-[8px] font-bold text-amber-700 bg-amber-100 px-1 py-0.5 rounded">
+                              <Gift className="h-2.5 w-2.5" />
+                              Free/Promo — verify before using for pricing
+                            </span>
+                          )}
+                        </td>
+
+                        {/* BARCODE / CODE */}
+                        <td className="p-1 px-2">
+                          <input type="text" className="bg-transparent border-b border-transparent hover:border-slate-300 focus:border-emerald-500 focus:outline-none p-0 text-[9px] font-mono text-slate-400 w-full" value={item.code || ""} onChange={(e) => handleUpdateItemField(index, "code", e.target.value)} placeholder="N/A" />
+                        </td>
+
+                        {/* QTY */}
+                        <td className="p-1 px-2 text-center">
+                          <input type="number" className="bg-transparent border-b border-transparent hover:border-slate-300 focus:border-emerald-500 focus:outline-none p-0 text-[10px] text-slate-800 w-full text-center font-bold" value={item.quantity} onChange={(e) => handleUpdateItemField(index, "quantity", parseInt(e.target.value) || 0)} />
+                        </td>
+
+                        {/* UNIT PRICE — pre-discount, excl-GST, editable */}
+                        <td className="p-1 px-2">
+                          <div className="relative">
+                            <span className="absolute left-0 bottom-0 text-[9px] text-slate-400">$</span>
                             <input
-                              type="text"
-                              placeholder="Enter barcode manually..."
-                              className="w-full text-[9px] font-mono p-0.5 border border-slate-200 rounded focus:border-emerald-500 focus:outline-none bg-white"
-                              onChange={(e) => {
-                                if (e.target.value.length > 4) {
-                                  handleUpdateItemField(index, "matchedProductId", e.target.value);
-                                  handleUpdateItemField(index, "code", e.target.value);
-                                }
-                              }}
+                              type="number" step="0.01"
+                              className="bg-transparent border-b border-transparent hover:border-slate-300 focus:border-emerald-500 focus:outline-none p-0 pl-2.5 text-[10px] w-full font-bold text-slate-800"
+                              value={(item as any).unitPrice ?? 0}
+                              onChange={(e) => handleUpdateItemField(index, "unitPrice" as any, parseFloat(e.target.value) || 0)}
                             />
                           </div>
-                        )}
-                      </td>
+                          {wasGstNormalized && (
+                            <span
+                              title="This docket's price column was labelled as including GST. The original printed figure was divided by 1.15 to get this excl-GST Unit Price."
+                              className="inline-flex items-center gap-0.5 mt-0.5 text-[8px] font-bold text-indigo-700 bg-indigo-100 px-1 py-0.5 rounded cursor-help"
+                            >
+                              <BadgePercent className="h-2.5 w-2.5" />
+                              GST removed (was ${originalIncGst.toFixed(2)} inc.)
+                            </span>
+                          )}
+                        </td>
 
-                      {/* PRODUCT NAME */}
-                      <td className="p-1 px-2">
-                        <input type="text" className="bg-transparent border-b border-transparent hover:border-slate-300 focus:border-emerald-500 focus:outline-none p-0 text-[10px] font-bold text-slate-800 w-full" value={item.name} onChange={(e) => handleUpdateItemField(index, "name", e.target.value)} />
-                        {isFreePromo && (
-                          <span className="inline-flex items-center gap-0.5 mt-0.5 text-[8px] font-bold text-amber-700 bg-amber-100 px-1 py-0.5 rounded">
-                            <Gift className="h-2.5 w-2.5" />
-                            Free/Promo — verify before using for pricing
-                          </span>
-                        )}
-                      </td>
-
-                      {/* BARCODE / CODE */}
-                      <td className="p-1 px-2">
-                        <input type="text" className="bg-transparent border-b border-transparent hover:border-slate-300 focus:border-emerald-500 focus:outline-none p-0 text-[9px] font-mono text-slate-400 w-full" value={item.code || ""} onChange={(e) => handleUpdateItemField(index, "code", e.target.value)} placeholder="N/A" />
-                      </td>
-
-                      {/* QTY */}
-                      <td className="p-1 px-2 text-center">
-                        <input type="number" className="bg-transparent border-b border-transparent hover:border-slate-300 focus:border-emerald-500 focus:outline-none p-0 text-[10px] text-slate-800 w-full text-center font-bold" value={item.quantity} onChange={(e) => handleUpdateItemField(index, "quantity", parseInt(e.target.value) || 0)} />
-                      </td>
-
-                      {/* UNIT PRICE — pre-discount, excl-GST, editable */}
-                      <td className="p-1 px-2">
-                        <div className="relative">
-                          <span className="absolute left-0 bottom-0 text-[9px] text-slate-400">$</span>
+                        {/* DISC % — editable */}
+                        <td className="p-1 px-2 text-center">
                           <input
-                            type="number" step="0.01"
-                            className="bg-transparent border-b border-transparent hover:border-slate-300 focus:border-emerald-500 focus:outline-none p-0 pl-2.5 text-[10px] w-full font-bold text-slate-800"
-                            value={(item as any).unitPrice ?? 0}
-                            onChange={(e) => handleUpdateItemField(index, "unitPrice" as any, parseFloat(e.target.value) || 0)}
+                            type="number" min="0" max="100" step="0.01"
+                            className={`bg-transparent border-b ${isFreePromo ? "border-amber-300 text-amber-700" : "border-transparent text-slate-800"} hover:border-slate-300 focus:border-emerald-500 focus:outline-none p-0 text-[10px] w-full text-center font-bold`}
+                            value={discPercent}
+                            onChange={(e) => handleUpdateItemField(index, "discPercent" as any, parseFloat(e.target.value) || 0)}
                           />
-                        </div>
-                        {wasGstNormalized && (
-                          <span
-                            title="This docket's price column was labelled as including GST. The original printed figure was divided by 1.15 to get this excl-GST Unit Price."
-                            className="inline-flex items-center gap-0.5 mt-0.5 text-[8px] font-bold text-indigo-700 bg-indigo-100 px-1 py-0.5 rounded cursor-help"
-                          >
-                            <BadgePercent className="h-2.5 w-2.5" />
-                            GST removed (was ${originalIncGst.toFixed(2)} inc.)
+                        </td>
+
+                        {/* BOX PRICE — computed, read-only */}
+                        <td className="p-1 px-2 text-right">
+                          <span className={`text-[10px] font-bold font-mono ${isFreePromo ? "text-amber-700" : "text-emerald-700"}`}>
+                            ${item.price.toFixed(2)}
                           </span>
-                        )}
-                      </td>
+                        </td>
 
-                      {/* DISC % — editable */}
-                      <td className="p-1 px-2 text-center">
-                        <input
-                          type="number" min="0" max="100" step="0.01"
-                          className={`bg-transparent border-b ${isFreePromo ? "border-amber-300 text-amber-700" : "border-transparent text-slate-800"} hover:border-slate-300 focus:border-emerald-500 focus:outline-none p-0 text-[10px] w-full text-center font-bold`}
-                          value={discPercent}
-                          onChange={(e) => handleUpdateItemField(index, "discPercent" as any, parseFloat(e.target.value) || 0)}
-                        />
-                      </td>
-
-                      {/* BOX PRICE — computed, read-only */}
-                      <td className="p-1 px-2 text-right">
-                        <span className={`text-[10px] font-bold font-mono ${isFreePromo ? "text-amber-700" : "text-emerald-700"}`}>
-                          ${item.price.toFixed(2)}
-                        </span>
-                      </td>
-
-                      {/* UNITS PER BOX — editable, pre-filled from OCR */}
-                      <td className="p-1 px-2 text-center">
-                        <input
-                          type="number"
-                          min="1"
-                          title="Number of individual units inside one box/carton, as printed on the docket"
-                          className="bg-amber-50/60 border border-amber-200 hover:border-amber-300 focus:border-emerald-500 focus:outline-none p-0.5 text-[10px] text-slate-800 w-full text-center font-bold rounded"
-                          value={(item as any).packQuantity ?? 1}
-                          onChange={(e) => handleUpdateItemField(index, "packQuantity" as any, parseInt(e.target.value) || 1)}
-                        />
-                      </td>
-                    </tr>
-                  );})}
+                        {/* UNITS PER BOX — editable, pre-filled from OCR */}
+                        <td className="p-1 px-2 text-center">
+                          <input
+                            type="number"
+                            min="1"
+                            title="Number of individual units inside one box/carton, as printed on the docket"
+                            className="bg-amber-50/60 border border-amber-200 hover:border-amber-300 focus:border-emerald-500 focus:outline-none p-0.5 text-[10px] text-slate-800 w-full text-center font-bold rounded"
+                            value={(item as any).packQuantity ?? 1}
+                            onChange={(e) => handleUpdateItemField(index, "packQuantity" as any, parseInt(e.target.value) || 1)}
+                          />
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>

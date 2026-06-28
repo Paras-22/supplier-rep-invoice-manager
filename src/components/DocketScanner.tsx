@@ -457,9 +457,9 @@ export default function DocketScanner({ reps, onScanConfirmed, currentUserUid }:
 
   // Runs OCR on a single page and returns its raw (un-merged) result. Kept
   // as its own function so handleStartOCRScan can fire one of these per
-  // file (in small chunks, not all at once — see OCR_CHUNK_SIZE below),
-  // the same general spirit as the staggered matching batches later in
-  // the pipeline.
+  // file (now fully sequential, not even in pairs — see OCR_CHUNK_SIZE
+  // below), the same general spirit as the staggered matching batches
+  // later in the pipeline.
   const ocrSinglePage = async (file: File, pageIndex: number): Promise<PageOcrResult> => {
     const { base64, mimeType } = await convertFileToBase64(file);
 
@@ -570,17 +570,23 @@ Critical rules:
     scanInFlightRef.current = true;
     setStatus("scanning");
     try {
-      // ── STEP 1: OCR every page, in SMALL CHUNKS rather than all at once ──
-      // Firing every page's OCR call simultaneously via Promise.all created
-      // a request burst large enough to trip the free-tier per-minute rate
-      // limit on its own — confirmed in production usage, where even a
-      // 2-page docket scan produced a spike to ~10-15 requests and several
-      // 429s. Chunking by OCR_CHUNK_SIZE with a short pause between chunks
-      // keeps small (1-2 page) scans behaving exactly as before — a single
-      // chunk, no pause — while preventing a larger multi-page upload from
-      // front-loading one big spike.
-      const OCR_CHUNK_SIZE = 2;
-      const OCR_CHUNK_DELAY_MS = 1500;
+      // ── STEP 1: OCR every page, FULLY SEQUENTIALLY ──────────────────────
+      // Originally this fired pages in pairs via Promise.all (OCR_CHUNK_SIZE
+      // = 2). In production, even a 2-page docket produced 2 SIMULTANEOUS
+      // Gemini calls, which combined with the matching phase starting right
+      // after was enough to spike past the free-tier per-minute limit (~10-15
+      // requests in under 2 seconds, confirmed via the AI Studio usage
+      // dashboard — 5 429s despite total daily usage being nowhere near the
+      // 250/day cap). The per-minute ceiling, not the daily one, is the real
+      // constraint at this tier.
+      //
+      // Fix: OCR_CHUNK_SIZE = 1 means every page is requested one at a time,
+      // never in parallel with another OCR call, with a pause after each one.
+      // This trades a small amount of wall-clock time (pages now run in
+      // series instead of pairs) for staying well under the per-minute
+      // ceiling even on a busy multi-page scan.
+      const OCR_CHUNK_SIZE = 1;
+      const OCR_CHUNK_DELAY_MS = 2500;
       const pageResults: PageOcrResult[] = [];
       for (let i = 0; i < pendingFiles.length; i += OCR_CHUNK_SIZE) {
         const chunk = pendingFiles.slice(i, i + OCR_CHUNK_SIZE);
@@ -592,6 +598,16 @@ Critical rules:
           await sleep(OCR_CHUNK_DELAY_MS);
         }
       }
+
+      // ── STEP 1.1: BREATHING ROOM between OCR phase and matching phase ───
+      // Even with OCR fully sequential, the matching phase used to start
+      // the INSTANT the last OCR call resolved — meaning the final OCR
+      // request and the first matching request could land inside the same
+      // few-hundred-millisecond window, right at the edge of the per-minute
+      // limit. This pause gives the rate-limit window real separation
+      // between "the OCR burst" and "the matching burst" as two distinct
+      // phases, rather than one continuous one.
+      await sleep(2000);
 
       // ── STEP 1.25: MERGE pages into one combined invoice ────────────────
       const merged = mergeOcrPayloads(pageResults);
@@ -672,7 +688,9 @@ Critical rules:
         ))
       );
 
-      // Run ALL queries in parallel
+      // Run ALL queries in parallel — these are Firestore reads, not Gemini
+      // calls, so they don't count against the Gemini per-minute limit and
+      // don't need staggering.
       const [wordResults, codeResults] = await Promise.all([
         Promise.all(wordQueries),
         Promise.all(codeQueries)
@@ -722,13 +740,15 @@ Critical rules:
       // STAGGERED start, not simultaneous — batches still run concurrently
       // (each one doesn't wait for the previous to FINISH), but their start
       // times are spread out by MATCH_BATCH_STAGGER_MS each, so 4-5 batches
-      // don't all hit the Gemini endpoint in the exact same instant. This
-      // is the same root cause as the OCR chunking above: a burst of
-      // simultaneous requests trips the per-minute rate limit even when
-      // the total request count for the scan wouldn't otherwise be a
-      // problem. Confirmed in production: a single 2-page scan spiked to
-      // ~10-15 simultaneous requests and several 429s before this change.
-      const MATCH_BATCH_STAGGER_MS = 600;
+      // don't all hit the Gemini endpoint in the exact same instant.
+      //
+      // Stagger increased from 600ms to 2500ms after production logs showed
+      // 600ms wasn't enough headroom — combined with the OCR phase's own
+      // burst landing in the same per-minute window, the total request
+      // density was still high enough to trip 429s. 2500ms keeps each
+      // batch's start comfortably spaced even when several batches are
+      // queued.
+      const MATCH_BATCH_STAGGER_MS = 2500;
       const batchPromises = batches.map(async (batch, batchIdx) => {
         if (batchIdx > 0) {
           await sleep(batchIdx * MATCH_BATCH_STAGGER_MS);
@@ -1125,7 +1145,7 @@ Return ONLY a JSON array, no markdown:
           <div className="text-center">
             <h3 className="text-xs font-bold text-slate-800">Gemini reading {pageCount > 1 ? `${pageCount} pages` : "your docket"}...</h3>
             <p className="text-[10px] text-slate-400 mt-0.5">Extracting supplier, products, quantities and prices.</p>
-            {pageCount > 1 && <p className="text-[9px] text-slate-300 mt-1">Pages scanned in small batches and merged into one invoice</p>}
+            {pageCount > 1 && <p className="text-[9px] text-slate-300 mt-1">Pages scanned one at a time and merged into one invoice</p>}
           </div>
         </div>
       )}

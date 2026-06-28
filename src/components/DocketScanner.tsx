@@ -22,16 +22,12 @@ const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
 // GST applied a second time downstream.
 const GST_RATE = 0.15;
 
-// Free-tier Gemini rate limits are PER-MINUTE, not daily — a burst of
-// requests close together (e.g. a manager retrying a failed scan, or a
-// docket with many items triggering several parallel matching batches)
-// trips a 429 long before any real daily quota is hit. Since staff using
-// this app won't read error messages carefully, the fix has to happen
-// invisibly inside the API call itself: detect 429 specifically and retry
-// automatically with increasing delays, so a transient rate-limit blip
-// resolves on its own without ever reaching the screen. Only after all
-// retries are exhausted does the error surface — and at that point it's a
-// genuine sustained-load situation, not a one-off blip.
+// Now on the PAID tier (billing linked) — per-minute rate limits are much
+// higher than free tier, so the aggressive staggering/delays used while on
+// free tier are mostly unnecessary now. Retries are kept as a safety net
+// for genuine transient issues (an occasional spend-based 429, or a
+// Google-side 503 overload) rather than as the primary defense — those
+// should now be rare edge cases, not a constant background concern.
 const MAX_GEMINI_RETRIES = 3;
 const RETRY_DELAY_MS = [2000, 5000, 10000]; // backoff: 2s, 5s, 10s
 
@@ -55,11 +51,6 @@ const callGemini = async (prompt: string, imagePart?: { mime_type: string; data:
   );
 
   if (!response.ok) {
-    // Rate limit (429) or transient server overload (503) — retry silently
-    // with backoff rather than failing the whole scan on the first bump.
-    // This is what makes a "retry storm" from someone mashing the button
-    // mostly invisible: the FIRST click's own internal retries usually
-    // absorb the rate limit before the person ever sees an error.
     if ((response.status === 429 || response.status === 503) && attempt < MAX_GEMINI_RETRIES) {
       await sleep(RETRY_DELAY_MS[attempt]);
       return callGemini(prompt, imagePart, attempt + 1);
@@ -105,6 +96,18 @@ const significantWords = (name: string): string[] => {
     .filter(w => !/^\d+(ML|G|KG|L|GM|MG)?$/.test(w)); // drop pure sizes like 500ML, 375, 130G
 };
 
+// Extracts size/volume/weight tokens specifically (500ML, 330ML, 1KG, 250G,
+// etc.) — these are deliberately EXCLUDED from significantWords() above
+// because they'd inflate false-positive overlap scores, but that means
+// significantWords() alone can't tell "MUSASHI MANGO 500ML" apart from
+// "MUSASHI MANGO 330ML" — both score high word overlap despite being
+// different products with different prices. This function exists purely
+// to catch that specific blind spot.
+const sizeTokens = (name: string): string[] => {
+  const matches = name.toUpperCase().match(/\d+(\.\d+)?\s*(ML|G|KG|L|GM|MG)\b/g) || [];
+  return matches.map(m => m.replace(/\s+/g, ""));
+};
+
 // THE SAFETY NET. Gemini's batch matching occasionally misaligns which
 // docket line a matchedId belongs to, especially on long dockets with many
 // similarly-named products (e.g. "Chocolate Mystery Cruncher" and
@@ -113,10 +116,20 @@ const significantWords = (name: string): string[] => {
 // products' price history. This check is a deterministic, code-level
 // verification that runs AFTER every Gemini match, regardless of what
 // confidence Gemini claims. If the candidate's actual stored name doesn't
-// share enough real word overlap with the docket line's name, the match is
-// rejected outright — it's treated as unmatched (safe: creates a new
-// product or flags for manual review) rather than silently saving a price
-// against the wrong product (unsafe: corrupts two products' history).
+// share enough real word overlap with the docket line's name, OR the two
+// names disagree on size/volume, the match is rejected outright — it's
+// treated as unmatched (safe: creates a new product or flags for manual
+// review) rather than silently saving a price against the wrong product
+// (unsafe: corrupts two products' history).
+//
+// Threshold raised from 0.5 -> 0.65 and a dedicated size-mismatch check
+// added after switching BATCH_SIZE from 8 -> 10: slightly larger batches
+// mean slightly more chance of two similar products sharing a batch, so
+// this net needed to be a bit stricter to compensate. The size check in
+// particular closes a real gap — two products that are identical except
+// for size/volume (e.g. different pack sizes of the same flavour) would
+// previously pass word-overlap easily despite being genuinely different
+// products with different real-world prices.
 const isMatchVerified = (docketName: string, candidateName: string): boolean => {
   const docketWords = significantWords(docketName);
   if (docketWords.length === 0) return true; // nothing meaningful to check against, don't block
@@ -125,7 +138,20 @@ const isMatchVerified = (docketName: string, candidateName: string): boolean => 
   const overlapCount = docketWords.filter(w => candidateWords.has(w)).length;
   const overlapRatio = overlapCount / docketWords.length;
 
-  return overlapRatio >= 0.5;
+  if (overlapRatio < 0.65) return false;
+
+  // Size/volume guard: if BOTH names contain a size token and those tokens
+  // don't match, reject regardless of how high the word overlap is. This
+  // is what stops "MANGO 500ML" from being matched against "MANGO 330ML"
+  // just because every other word lines up.
+  const docketSizes = sizeTokens(docketName);
+  const candidateSizes = sizeTokens(candidateName);
+  if (docketSizes.length > 0 && candidateSizes.length > 0) {
+    const sizesAgree = docketSizes.some(s => candidateSizes.includes(s));
+    if (!sizesAgree) return false;
+  }
+
+  return true;
 };
 
 // Given one batch of docket items, returns ONLY the candidates that could
@@ -134,10 +160,10 @@ const isMatchVerified = (docketName: string, candidateName: string): boolean => 
 // every candidate gathered from every item on the entire docket as input
 // text, which meant a 20-item docket split into 3 batches would resend a
 // large shared candidate list 3 times over, ballooning input tokens (and
-// therefore rate-limit pressure) for no benefit — a batch of 8 items can
-// only ever match against candidates sharing a brand-word with THOSE 8
-// items, never the other 12. Narrowing this is a pure cost reduction with
-// no change in matching behavior.
+// therefore cost) for no benefit — a batch of items can only ever match
+// against candidates sharing a brand-word with THOSE items, never the
+// others. Narrowing this is a pure cost reduction with no change in
+// matching behavior.
 const getRelevantCandidatesForBatch = (
   batchItems: { item: any }[],
   allCandidates: { id: string; name: string; sku: string }[]
@@ -455,11 +481,7 @@ export default function DocketScanner({ reps, onScanConfirmed, currentUserUid }:
     }, 1000);
   };
 
-  // Runs OCR on a single page and returns its raw (un-merged) result. Kept
-  // as its own function so handleStartOCRScan can fire one of these per
-  // file (now fully sequential, not even in pairs — see OCR_CHUNK_SIZE
-  // below), the same general spirit as the staggered matching batches
-  // later in the pipeline.
+  // Runs OCR on a single page and returns its raw (un-merged) result.
   const ocrSinglePage = async (file: File, pageIndex: number): Promise<PageOcrResult> => {
     const { base64, mimeType } = await convertFileToBase64(file);
 
@@ -493,7 +515,7 @@ Critical rules:
 - Include: Brand + Product Type + Size/Volume + Flavour
 - Remove pack multipliers (x12, X24, *12, 12pk, per carton, x10/pack) from the NAME field only — but capture that exact number in "packQuantity" instead of discarding it. These multipliers can appear anywhere in the description, with x, X, or * as the separator, in brackets or not, in any position (e.g. "DRAGON COOL BANANA SPRAY (9)" → packQuantity 9, "MUSASHI ENERGY MANGO 500ML 12PK" → packQuantity 12, "KOBI SALTED PEANUTS 130GX24CTN" → packQuantity 24)
 - If no pack size number is visible anywhere for a line (e.g. loose produce, single units), set "packQuantity" to 1
-- Keep product size like 375ML, 500ML, 130G, 43G, 26G in the name
+- Keep product size like 375ML, 500ML, 130G, 43G, 26G in the name — this is CRITICAL for distinguishing between different pack sizes of the same product, which have different prices
 - "unitPrice" must be the PRE-discount box/case price column exactly as printed — never the final/extended/total/amount column, and never with any discount already applied. Return the RAW printed number regardless of gstStatus — GST adjustment is handled separately, do not do it yourself
 - "gstStatus" is determined by reading the actual column headers / labels on THIS docket, not by assumption — look for words like "inc-GST", "incl GST", "GST inclusive" (→ "inclusive") vs "excl GST", "ex-GST", "+GST" (→ "exclusive"). If you see no such label anywhere near the price columns, use "exclusive" (the NZ wholesale default), not "unknown". Only use "unknown" if there are conflicting or unreadable labels
 - "discPercent" must be the discount percentage column exactly as printed, as a plain number with no % sign (e.g. write 24, not "24%"). If the docket has no discount column at all, or shows 0% for this line, use 0
@@ -520,23 +542,9 @@ Critical rules:
   // (the order set by the reorder UI before scanning started).
   //
   // Header fields (supplier/rep/phone/email/date): FIRST non-empty value
-  // across pages wins — this is what fixes the "page 2 has no letterhead"
-  // problem, since page 2's empty supplierName simply gets skipped in
-  // favor of page 1's real one, rather than page 2 being treated as a
-  // standalone docket with no identifiable supplier.
-  //
-  // totalAmount: takes the LARGEST non-zero value found across all pages,
-  // not the first or a sum. Multi-page invoices commonly print the real
-  // grand total only on the final page (continuation pages show partial
-  // subtotals or nothing) — summing would double-count if more than one
-  // page shows a running total, and "first non-empty" could grab an early
-  // page's subtotal instead of the true total. Largest-value is the
-  // simplest heuristic that's correct for the common real-world layouts
-  // (subtotal-then-grand-total, or only-the-last-page-has-a-total).
-  //
-  // items: concatenated across all pages in order — this is the one field
-  // that genuinely combines rather than picks a single winner, since every
-  // page's line items are real products that need to be saved.
+  // across pages wins. totalAmount takes the LARGEST non-zero value found
+  // across all pages (handles grand-total-on-last-page layouts correctly).
+  // items: concatenated across all pages in order.
   const mergeOcrPayloads = (pageResults: PageOcrResult[]) => {
     const firstNonEmpty = (getter: (p: PageOcrResult) => string | null): string | null => {
       for (const p of pageResults) {
@@ -561,8 +569,6 @@ Critical rules:
   };
 
   const handleStartOCRScan = async () => {
-    // Belt-and-suspenders lock — prevents a second scan from starting while
-    // one is already in flight, even if status hasn't re-rendered yet.
     if (scanInFlightRef.current) return;
     if (pendingFiles.length === 0) { setStatus("error"); setErrorMessage("Please select at least one file to scan."); return; }
     if (!GEMINI_API_KEY) { setStatus("error"); setErrorMessage("Gemini API key not found. Add VITE_GEMINI_API_KEY to your .env file."); return; }
@@ -570,23 +576,14 @@ Critical rules:
     scanInFlightRef.current = true;
     setStatus("scanning");
     try {
-      // ── STEP 1: OCR every page, FULLY SEQUENTIALLY ──────────────────────
-      // Originally this fired pages in pairs via Promise.all (OCR_CHUNK_SIZE
-      // = 2). In production, even a 2-page docket produced 2 SIMULTANEOUS
-      // Gemini calls, which combined with the matching phase starting right
-      // after was enough to spike past the free-tier per-minute limit (~10-15
-      // requests in under 2 seconds, confirmed via the AI Studio usage
-      // dashboard — 5 429s despite total daily usage being nowhere near the
-      // 250/day cap). The per-minute ceiling, not the daily one, is the real
-      // constraint at this tier.
-      //
-      // Fix: OCR_CHUNK_SIZE = 1 means every page is requested one at a time,
-      // never in parallel with another OCR call, with a pause after each one.
-      // This trades a small amount of wall-clock time (pages now run in
-      // series instead of pairs) for staying well under the per-minute
-      // ceiling even on a busy multi-page scan.
-      const OCR_CHUNK_SIZE = 1;
-      const OCR_CHUNK_DELAY_MS = 2500;
+      // ── STEP 1: OCR every page ───────────────────────────────────────────
+      // Now on paid tier — pages can run in small concurrent pairs again
+      // rather than fully sequential, since the per-minute ceiling that
+      // forced strict sequencing on free tier is no longer the binding
+      // constraint. A short delay between chunks is kept as cheap
+      // insurance, not because it's required at this volume.
+      const OCR_CHUNK_SIZE = 2;
+      const OCR_CHUNK_DELAY_MS = 500;
       const pageResults: PageOcrResult[] = [];
       for (let i = 0; i < pendingFiles.length; i += OCR_CHUNK_SIZE) {
         const chunk = pendingFiles.slice(i, i + OCR_CHUNK_SIZE);
@@ -599,37 +596,16 @@ Critical rules:
         }
       }
 
-      // ── STEP 1.1: BREATHING ROOM between OCR phase and matching phase ───
-      // Even with OCR fully sequential, the matching phase used to start
-      // the INSTANT the last OCR call resolved — meaning the final OCR
-      // request and the first matching request could land inside the same
-      // few-hundred-millisecond window, right at the edge of the per-minute
-      // limit. This pause gives the rate-limit window real separation
-      // between "the OCR burst" and "the matching burst" as two distinct
-      // phases, rather than one continuous one.
-      await sleep(2000);
-
       // ── STEP 1.25: MERGE pages into one combined invoice ────────────────
       const merged = mergeOcrPayloads(pageResults);
 
       // ── STEP 1.5: GST NORMALIZATION — deterministic, code-level ────────
       // This app stores PriceEntry.unitPrice / PriceEntry.price as EX-GST
       // everywhere — ProductCatalog.tsx and RepDirectory.tsx both multiply
-      // by 1.15 themselves to show "inc. GST" figures. Some supplier
-      // dockets (e.g. MG International) print their "Unit Price" column as
-      // ALREADY including GST. If that raw inc-GST number flowed through
-      // unchanged, the app's own ×1.15 display logic would apply GST a
-      // SECOND time, inflating the per-unit (inc. GST) figure shown to
-      // staff. Gemini is asked to detect and report gstStatus per line
-      // above, but the actual ÷1.15 division happens here in plain
-      // arithmetic — not inside the LLM prompt — so it's deterministic and
-      // auditable rather than trusting Gemini's mental maths.
-      //
-      // originalUnitPriceIncGst is kept on the item (when normalization
-      // happened) purely so the review table can show a small "GST
-      // removed" badge — a visual check, since OCR's gstStatus read won't
-      // be 100% reliable and a misread should be easy to catch and correct
-      // in review, not silently trusted.
+      // by 1.15 themselves to show "inc. GST" figures. The actual ÷1.15
+      // division happens here in plain arithmetic — not inside the LLM
+      // prompt — so it's deterministic and auditable rather than trusting
+      // Gemini's mental maths.
       const rawItems: any[] = merged.items || [];
       const items: any[] = rawItems.map((item: any) => {
         const parsedRaw = typeof item.unitPrice === "number" ? item.unitPrice : parseFloat(item.unitPrice);
@@ -653,7 +629,6 @@ Critical rules:
       setStatus("matching");
       setMatchingProgress("Collecting unique search terms...");
 
-      // Collect all unique first words across ALL docket items — deduped
       const firstWords = new Set<string>();
       const codes = new Set<string>();
 
@@ -666,10 +641,8 @@ Critical rules:
 
       setMatchingProgress(`Searching database for ${firstWords.size} unique brands...`);
 
-      // ONE batch query per unique first word — fetch all candidates at once
       const candidateMap: Map<string, { id: string; name: string; sku: string }> = new Map();
 
-      // Fetch by first word (brand name) — covers most products
       const wordQueries = Array.from(firstWords).map(word =>
         getDocs(query(
           collection(db, "products"),
@@ -679,7 +652,6 @@ Critical rules:
         ))
       );
 
-      // Fetch by supplier code
       const codeQueries = Array.from(codes).map(code =>
         getDocs(query(
           collection(db, "products"),
@@ -688,15 +660,11 @@ Critical rules:
         ))
       );
 
-      // Run ALL queries in parallel — these are Firestore reads, not Gemini
-      // calls, so they don't count against the Gemini per-minute limit and
-      // don't need staggering.
       const [wordResults, codeResults] = await Promise.all([
         Promise.all(wordQueries),
         Promise.all(codeQueries)
       ]);
 
-      // Build candidate map in memory — zero more Firestore reads after this
       [...wordResults, ...codeResults].forEach(snap => {
         snap.docs.forEach(d => {
           candidateMap.set(d.id, {
@@ -710,24 +678,16 @@ Critical rules:
       const allCandidates = Array.from(candidateMap.values());
 
       // ── STEP 3: BATCHED Gemini matching ─────────────────────────────────
-      // Previously this was ONE Gemini call matching the entire docket
-      // (sometimes 30-45 lines) against the entire candidate list (often
-      // 195+ products) in a single structured-output response. On long
-      // dockets with several similarly-named products sitting near each
-      // other (e.g. "Chocolate Mystery Cruncher" and "Raspberry Bar"), this
-      // caused the model to occasionally misalign which matchedId belongs
-      // to which productIndex — silently attaching the WRONG product's
-      // price to a docket line. That's a serious bug for an app whose whole
-      // job is tracking exact costs.
-      //
-      // Fix, layer 1: split items into small batches (8 at a time) so each
-      // individual Gemini call has a short, manageable output to track,
-      // drastically reducing the chance of index misalignment. Batches run
-      // CONCURRENTLY (each doesn't wait for the previous to finish) but
-      // with STAGGERED start times — see MATCH_BATCH_STAGGER_MS below —
-      // so total wall-clock time stays close to a fully-parallel approach
-      // while avoiding firing every batch in the exact same instant.
-      const BATCH_SIZE = 8;
+      // BATCH_SIZE raised from 8 -> 10. This is a deliberate middle ground:
+      // larger batches mean fewer total Gemini calls (lower cost, since
+      // every call repeats shared prompt boilerplate), but too large
+      // reintroduces the index-misalignment risk this batching was built
+      // to prevent in the first place. 10 was chosen over a more
+      // cost-aggressive 14-16 specifically because matching accuracy is
+      // the higher priority here — the isMatchVerified() safety net below
+      // was also tightened (0.5 -> 0.65 overlap threshold, plus a new
+      // size/volume mismatch check) to compensate for the larger batch.
+      const BATCH_SIZE = 10;
       const batches: { item: any; originalIndex: number }[][] = [];
       for (let i = 0; i < items.length; i += BATCH_SIZE) {
         batches.push(
@@ -737,28 +697,15 @@ Critical rules:
 
       setMatchingProgress(`Matching ${items.length} products in ${batches.length} batch${batches.length > 1 ? "es" : ""} of up to ${BATCH_SIZE}...`);
 
-      // STAGGERED start, not simultaneous — batches still run concurrently
-      // (each one doesn't wait for the previous to FINISH), but their start
-      // times are spread out by MATCH_BATCH_STAGGER_MS each, so 4-5 batches
-      // don't all hit the Gemini endpoint in the exact same instant.
-      //
-      // Stagger increased from 600ms to 2500ms after production logs showed
-      // 600ms wasn't enough headroom — combined with the OCR phase's own
-      // burst landing in the same per-minute window, the total request
-      // density was still high enough to trip 429s. 2500ms keeps each
-      // batch's start comfortably spaced even when several batches are
-      // queued.
-      const MATCH_BATCH_STAGGER_MS = 2500;
+      // Stagger reduced from 2500ms -> 400ms now that paid-tier RPM is the
+      // constraint, not free-tier. Batches still don't all fire in the
+      // exact same instant, but the gap no longer needs to be large.
+      const MATCH_BATCH_STAGGER_MS = 400;
       const batchPromises = batches.map(async (batch, batchIdx) => {
         if (batchIdx > 0) {
           await sleep(batchIdx * MATCH_BATCH_STAGGER_MS);
         }
 
-        // Fix, cost layer: only send candidates relevant to THIS batch's
-        // items instead of the full docket-wide candidate list. Cuts input
-        // tokens substantially on dockets with several batches, which
-        // directly reduces how fast a scan can approach the per-minute
-        // rate limit in the first place.
         const relevantCandidates = getRelevantCandidatesForBatch(batch, allCandidates);
 
         const matchPrompt = `You are a product matching assistant for a New Zealand supermarket.
@@ -774,12 +721,12 @@ ${relevantCandidates.map(c => `- ID: ${c.id} | Name: ${c.name} | SKU: ${c.sku}`)
 Matching rules:
 - Match by brand + product type + size/volume + flavour
 - Word order differences are OK (MUSASHI ENERGY MANGO 500ML = MUSASHI 500ML MANGO)
-- Size must match (500ML ≠ 375ML)
+- Size/volume MUST match exactly — 500ML and 330ML are DIFFERENT products with different prices, even if every other word matches. Never treat different sizes of the same flavour as interchangeable.
 - Flavour must match (MANGO ≠ PINEAPPLE)
 - If supplier code matches SKU exactly — that is a definitive match
 - If no reasonable match exists — use null
 - Do NOT force a wrong match
-- Be especially careful not to confuse different products that happen to be listed near each other — verify the brand AND product type AND size all genuinely match before accepting
+- Be especially careful not to confuse different products that happen to be listed near each other, or different sizes of the same product — verify the brand AND product type AND size all genuinely match before accepting
 
 Return ONLY a JSON array, no markdown:
 [
@@ -796,10 +743,6 @@ Return ONLY a JSON array, no markdown:
           batchResults = [];
         }
 
-        // Map each batch-local productIndex (1-based, within this batch)
-        // back to the item's ORIGINAL position in the full docket list —
-        // this is what prevents batching itself from introducing a NEW
-        // index-mixup on reassembly.
         return batchResults.map(r => ({
           originalIndex: batch[r.productIndex - 1]?.originalIndex,
           matchedId: r.matchedId,
@@ -811,36 +754,27 @@ Return ONLY a JSON array, no markdown:
       const matchResultsByIndex = new Map(allBatchResults.map(r => [r.originalIndex, r]));
 
       // Build final items — only accept high/medium confidence matches
-      // that ALSO pass the deterministic word-overlap verification below.
-      // Box price is computed here, deterministically, from two numbers
-      // — the (already GST-normalized) unitPrice and discPercent — no LLM
-      // reasoning happens in this calculation, only plain arithmetic:
-      // boxPrice = unitPrice × (1 − discPercent / 100)
+      // that ALSO pass the deterministic word-overlap + size verification
+      // below. Box price is computed here, deterministically, from two
+      // numbers — the (already GST-normalized) unitPrice and discPercent
+      // — no LLM reasoning happens in this calculation, only plain
+      // arithmetic: boxPrice = unitPrice × (1 − discPercent / 100)
       let rejectedMatchCount = 0;
       const matchedItems: InvoiceItem[] = items.map((item: any, index: number) => {
         const match = matchResultsByIndex.get(index);
         const llmAcceptedMatch = !!match?.matchedId && match.confidence !== "low" && match.confidence !== "none";
         const candidate = llmAcceptedMatch ? candidateMap.get(match!.matchedId!) : null;
 
-        // Fix, layer 2: the safety net. Even if Gemini claims a confident
-        // match, verify it deterministically using real word overlap
-        // between the docket line's name and the candidate's actual stored
-        // name. This is what catches and blocks an index-misalignment slip
-        // BEFORE it can save a price against the wrong product — the
-        // previous version had no check at all here and trusted Gemini's
-        // output completely.
         const verified = candidate ? isMatchVerified(item.name || "", candidate.name) : false;
         const acceptMatch = llmAcceptedMatch && verified;
 
         if (llmAcceptedMatch && !verified) {
           rejectedMatchCount++;
           console.warn(
-            `Match rejected by verification: docket item "${item.name}" was matched to candidate "${candidate?.name}" (${match?.matchedId}) but failed word-overlap check. Treating as unmatched.`
+            `Match rejected by verification: docket item "${item.name}" was matched to candidate "${candidate?.name}" (${match?.matchedId}) but failed word-overlap or size check. Treating as unmatched.`
           );
         }
 
-        // unitPrice has already been GST-normalized (ex-GST) in Step 1.5
-        // above — this is just type coercion, no GST math happens here.
         const rawUnitPrice = typeof item.unitPrice === "number" ? item.unitPrice : parseFloat(item.unitPrice);
         const unitPrice = !isNaN(rawUnitPrice) ? rawUnitPrice : 0;
 
@@ -861,18 +795,10 @@ Return ONLY a JSON array, no markdown:
           quantity,
           price: Math.round(boxPrice * 100) / 100,
           packQuantity,
-          // Kept for reference/verification — not used in any further
-          // calculation beyond the one boxPrice computation above.
           unitPrice,
           discPercent,
-          // GST audit trail — gstStatus/originalUnitPriceIncGst are purely
-          // informational (drive the review-table badge); they are NOT
-          // used in any price calculation and are safe to ignore elsewhere.
           gstStatus: item.gstStatus || "exclusive",
           originalUnitPriceIncGst: item.originalUnitPriceIncGst ?? null,
-          // Which uploaded page this line came from — purely informational,
-          // shown as a small tag in the review table so a multi-page scan
-          // is easy to sanity-check against the physical pages.
           sourcePage: item.sourcePage ?? null,
           matchedProductId: acceptMatch ? match!.matchedId! : "",
           matchedProductName: acceptMatch ? (candidate?.name || "") : ""
@@ -902,9 +828,6 @@ Return ONLY a JSON array, no markdown:
         items: matchedItems
       });
 
-      // Save pending invoice draft. fileName records every page's
-      // filename joined together, so the saved invoice record is
-      // traceable back to which uploaded files produced it.
       const invoiceRef = doc(collection(db, "invoices"));
       await setDoc(invoiceRef, {
         id: invoiceRef.id,
@@ -924,13 +847,8 @@ Return ONLY a JSON array, no markdown:
 
     } catch (err: any) {
       console.error("Scanning failed:", err);
-      // RATE_LIMITED means every internal retry in callGemini already
-      // failed — this is a genuine sustained-load situation, not a blip.
-      // Force a visible, timed cooldown instead of a plain error message,
-      // since a staff member retrying immediately would almost certainly
-      // hit the same wall again.
       if (err.message === "RATE_LIMITED") {
-        setErrorMessage("Gemini is temporarily busy (free-tier rate limit). The app will let you retry automatically in a moment — please don't refresh.");
+        setErrorMessage("Gemini is temporarily busy. The app will let you retry automatically in a moment — please don't refresh.");
         startCooldown(30);
       } else {
         setStatus("error");
@@ -946,8 +864,6 @@ Return ONLY a JSON array, no markdown:
     const itemsCopy = [...extractedData.items];
     itemsCopy[index] = { ...itemsCopy[index], [field]: value };
 
-    // If the manager edits unitPrice or discPercent directly, recompute the
-    // box price live so what gets saved always matches what's displayed.
     if (field === ("unitPrice" as any) || field === ("discPercent" as any)) {
       const up = field === ("unitPrice" as any) ? value : (itemsCopy[index] as any).unitPrice;
       const dp = field === ("discPercent" as any) ? value : (itemsCopy[index] as any).discPercent;
@@ -1145,7 +1061,7 @@ Return ONLY a JSON array, no markdown:
           <div className="text-center">
             <h3 className="text-xs font-bold text-slate-800">Gemini reading {pageCount > 1 ? `${pageCount} pages` : "your docket"}...</h3>
             <p className="text-[10px] text-slate-400 mt-0.5">Extracting supplier, products, quantities and prices.</p>
-            {pageCount > 1 && <p className="text-[9px] text-slate-300 mt-1">Pages scanned one at a time and merged into one invoice</p>}
+            {pageCount > 1 && <p className="text-[9px] text-slate-300 mt-1">Pages scanned and merged into one invoice</p>}
           </div>
         </div>
       )}
@@ -1197,7 +1113,6 @@ Return ONLY a JSON array, no markdown:
             </div>
           </div>
 
-          {/* Show extracted rep contact info, if any, so it's visible before confirming */}
           {(extractedData.repPhone || extractedData.repEmail) && (
             <div className="flex items-center gap-3 p-2 bg-emerald-50/50 border border-emerald-100 rounded text-[10px] text-emerald-800">
               <span className="font-bold uppercase text-[8px] tracking-wider">Contact found on docket:</span>
@@ -1207,7 +1122,6 @@ Return ONLY a JSON array, no markdown:
             </div>
           )}
 
-          {/* GST normalization notice — only shown when at least one line was detected as inc-GST and adjusted */}
           {gstNormalizedCount > 0 && (
             <div className="flex items-start gap-2 p-2 bg-indigo-50/60 border border-indigo-200 rounded text-[10px] text-indigo-800">
               <BadgePercent className="h-3.5 w-3.5 shrink-0 mt-0.5" />
@@ -1218,7 +1132,7 @@ Return ONLY a JSON array, no markdown:
           )}
 
           <div className="p-2 bg-emerald-50/60 border border-emerald-200 rounded text-[10px] text-emerald-800 leading-relaxed">
-            <strong>Box Price = Unit Price × (1 − Disc%).</strong> Both numbers are extracted exactly as printed (Unit Price is shown here excl-GST, after automatic GST normalization if needed) and the discount is applied automatically. Lines with a 100% discount are flagged in amber — these are usually free/promo items and the $0.00 box price should NOT be used for retail pricing decisions. Matches are now verified by real word-overlap before being accepted — if a line shows "No match," double-check it manually rather than assuming the database lacks the product.
+            <strong>Box Price = Unit Price × (1 − Disc%).</strong> Both numbers are extracted exactly as printed (Unit Price is shown here excl-GST, after automatic GST normalization if needed) and the discount is applied automatically. Lines with a 100% discount are flagged in amber — these are usually free/promo items and the $0.00 box price should NOT be used for retail pricing decisions. Matches are now verified by real word-overlap AND size/volume agreement before being accepted — if a line shows "No match," double-check it manually rather than assuming the database lacks the product.
           </div>
 
           <div className="space-y-1.5">
@@ -1439,10 +1353,7 @@ Return ONLY a JSON array, no markdown:
         </motion.div>
       )}
 
-      {/* COOLDOWN — genuine rate-limit exhaustion. Buttons are not just
-          discouraged, the whole panel replaces the error state so there is
-          nothing clickable that could trigger another request during the
-          wait. */}
+      {/* COOLDOWN */}
       {status === "cooldown" && (
         <div className="py-8 text-center space-y-3">
           <div className="inline-flex items-center justify-center p-2 bg-amber-100 rounded-full text-amber-600">
